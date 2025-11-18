@@ -260,6 +260,10 @@ impl SchedPool {
         }
     }
 
+    pub fn high_priority_uses_shared_pool(&self) -> bool {
+        matches!(self.queue_type, QueueType::Dynamic) && self.can_use_priority()
+    }
+
     pub fn get_pool_size(&self, priority_level: CommandPri) -> usize {
         match self.queue_type {
             QueueType::Vanilla => self.vanilla.get_pool_size(priority_level),

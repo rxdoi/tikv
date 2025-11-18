@@ -66,6 +66,43 @@ const FALLBACK_BLOCK_CACHE_CAPACITY: ReadableSize = ReadableSize::mb(128);
 
 const DEFAULT_ACTION_ON_INVALID_MAX_TS_UPDATE: &str = "panic";
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, OnlineConfig)]
+#[serde(default)]
+#[serde(rename_all = "kebab-case")]
+pub struct AgentSchedulingConfig {
+    pub enable: bool,
+    pub threshold_high: usize,
+    pub threshold_medium: usize,
+    pub threshold_low: usize,
+    pub base_recheck_delay: ReadableDuration,
+    pub urgency_margin: ReadableDuration,
+}
+
+impl Default for AgentSchedulingConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            threshold_high: 0,
+            threshold_medium: 1,
+            threshold_low: 2,
+            base_recheck_delay: ReadableDuration::millis(5),
+            urgency_margin: ReadableDuration::millis(10),
+        }
+    }
+}
+
+impl AgentSchedulingConfig {
+    fn validate(&self) -> Result<(), Box<dyn Error>> {
+        if self.base_recheck_delay.0.is_zero() {
+            return Err("agent scheduling base recheck delay must be > 0".into());
+        }
+        if self.urgency_margin.0.is_zero() {
+            return Err("agent scheduling urgency margin must be > 0".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum EngineType {
@@ -118,6 +155,8 @@ pub struct Config {
     pub io_rate_limit: IoRateLimitConfig,
     #[online_config(submodule)]
     pub max_ts: MaxTsConfig,
+    #[online_config(submodule)]
+    pub agent_scheduling: AgentSchedulingConfig,
 }
 
 impl Default for Config {
@@ -148,6 +187,7 @@ impl Default for Config {
             background_error_recovery_window: ReadableDuration::hours(1),
             memory_quota: DEFAULT_TXN_MEMORY_QUOTA_CAPACITY,
             max_ts: MaxTsConfig::default(),
+            agent_scheduling: AgentSchedulingConfig::default(),
         }
     }
 }
@@ -189,6 +229,7 @@ impl Config {
 
     pub fn validate(&mut self) -> Result<(), Box<dyn Error>> {
         self.validate_engine_type()?;
+        self.agent_scheduling.validate()?;
 
         if self.scheduler_concurrency > MAX_SCHED_CONCURRENCY {
             warn!(

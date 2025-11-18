@@ -24,13 +24,16 @@
 //! library, which is transparent to the scheduler.
 
 use std::{
+    cmp,
+    collections::BTreeMap,
     marker::PhantomData,
     mem,
     sync::{
-        Arc,
+        Arc, Condvar, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    thread,
+    time::{Duration, Instant as StdInstant},
 };
 
 use causal_ts::CausalTsProviderImpl;
@@ -65,7 +68,7 @@ use crate::{
     storage::{
         DynamicConfigs, Error as StorageError, ErrorInner as StorageErrorInner,
         PessimisticLockKeyResult, PessimisticLockResults,
-        config::Config,
+        config::{AgentSchedulingConfig, Config},
         errors::SharedError,
         get_causal_ts, get_priority_tag, get_raw_key_guard,
         kv::{
@@ -194,6 +197,53 @@ impl TaskContext {
     }
 }
 
+#[derive(Default)]
+struct WorkerLoad {
+    high_running: AtomicUsize,
+    shared_running: AtomicUsize,
+}
+
+#[derive(Clone, Copy)]
+enum LoadClass {
+    High,
+    Shared,
+}
+
+impl WorkerLoad {
+    fn acquire(&self, priority: CommandPri, high_shared: bool) -> LoadClass {
+        if priority == CommandPri::High && !high_shared {
+            self.high_running.fetch_add(1, Ordering::SeqCst);
+            LoadClass::High
+        } else {
+            self.shared_running.fetch_add(1, Ordering::SeqCst);
+            LoadClass::Shared
+        }
+    }
+
+    fn release(&self, class: LoadClass) {
+        match class {
+            LoadClass::High => {
+                self.high_running.fetch_sub(1, Ordering::SeqCst);
+            }
+            LoadClass::Shared => {
+                self.shared_running.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn running_high(&self) -> usize {
+        self.high_running.load(Ordering::Relaxed)
+    }
+
+    fn running_shared(&self) -> usize {
+        self.shared_running.load(Ordering::Relaxed)
+    }
+
+    fn total_running(&self) -> usize {
+        self.running_high() + self.running_shared()
+    }
+}
+
 pub enum SchedulerTaskCallback {
     NormalRequestCallback(StorageCallback),
     LockKeyCallbacks(Vec<PessimisticLockKeyCallback>),
@@ -286,6 +336,7 @@ struct TxnSchedulerInner<L: LockManager> {
 
     in_memory_peer_size_limit: Arc<AtomicU64>,
     in_memory_instance_size_limit: Arc<AtomicU64>,
+    worker_load: Arc<WorkerLoad>,
 }
 
 #[inline]
@@ -418,6 +469,7 @@ impl<L: LockManager> TxnSchedulerInner<L> {
 #[derive(Clone)]
 pub struct TxnScheduler<E: Engine, L: LockManager> {
     inner: Arc<TxnSchedulerInner<L>>,
+    agent_scheduler: Option<Arc<AgentSchedulerRuntime>>,
     // The engine can be fetched from the thread local storage of scheduler threads.
     // So, we don't store the engine here.
     _engine: PhantomData<E>,
@@ -482,6 +534,7 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
             memory_quota: Arc::new(MemoryQuota::new(config.memory_quota.0 as _)),
             in_memory_peer_size_limit: dynamic_configs.in_memory_peer_size_limit,
             in_memory_instance_size_limit: dynamic_configs.in_memory_instance_size_limit,
+            worker_load: Arc::new(WorkerLoad::default()),
         });
 
         SCHED_TXN_MEMORY_QUOTA
@@ -492,10 +545,17 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
             t.saturating_elapsed(),
             "initialized the transaction scheduler"
         );
-        TxnScheduler {
+        let mut scheduler = TxnScheduler {
             inner,
+            agent_scheduler: None,
             _engine: PhantomData,
+        };
+        if config.agent_scheduling.enable {
+            let runtime =
+                AgentSchedulerRuntime::start(config.agent_scheduling.clone(), scheduler.clone());
+            scheduler.agent_scheduler = Some(runtime);
         }
+        scheduler
     }
 
     pub fn dump_wait_for_entries(&self, cb: waiter_manager::Callback) {
@@ -535,11 +595,18 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
         }
         let cid = self.inner.gen_id();
         if let Ok(task) = Task::allocate(cid, cmd, self.inner.memory_quota.clone()) {
-            self.schedule_command(
-                task,
-                SchedulerTaskCallback::NormalRequestCallback(callback),
-                None,
-            );
+            let sched_cb = SchedulerTaskCallback::NormalRequestCallback(callback);
+            if let Some(runtime) = &self.agent_scheduler {
+                if let Some(delay_budget) = Self::delay_budget_for_command(task.cmd()) {
+                    if let Some(deadline) =
+                        self.should_delay_task(task.cmd(), runtime, delay_budget)
+                    {
+                        runtime.enqueue(DelayedWriteRequest::new(task, sched_cb, None, deadline));
+                        return;
+                    }
+                }
+            }
+            self.schedule_command(task, sched_cb, None);
         } else {
             Self::fail_with_busy(tag, callback.into());
         }
@@ -603,6 +670,61 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
         let task = tctx.task.as_ref().unwrap();
         self.fail_fast_or_check_deadline(cid, task.cmd(), tracker_token);
         fail_point!("txn_scheduler_acquire_fail");
+    }
+
+    fn delay_budget_for_command(cmd: &Command) -> Option<Duration> {
+        if cmd.readonly() {
+            return None;
+        }
+        let delay_ms = u64::from(cmd.ctx().busy_threshold_ms);
+        if delay_ms == 0 {
+            return None;
+        }
+        Some(Duration::from_millis(delay_ms))
+    }
+
+    fn should_delay_task(
+        &self,
+        cmd: &Command,
+        runtime: &AgentSchedulerRuntime,
+        delay_budget: Duration,
+    ) -> Option<StdInstant> {
+        let required = runtime.threshold_for(cmd.priority());
+        if required == 0 {
+            return None;
+        }
+        let available = self.available_threads_for_priority(cmd.priority());
+        if available >= required {
+            return None;
+        }
+
+        let now = StdInstant::now();
+        let agent_deadline = match now.checked_add(delay_budget) {
+            Some(deadline) => deadline,
+            None => return None,
+        };
+        let command_deadline = cmd.deadline().to_std_instant();
+        if command_deadline <= now {
+            return None;
+        }
+        let deadline = cmp::min(agent_deadline, command_deadline);
+        if now + runtime.urgency_margin() >= deadline {
+            return None;
+        }
+        Some(deadline)
+    }
+
+    fn available_threads_for_priority(&self, priority: CommandPri) -> usize {
+        let total = self.get_sched_pool().get_pool_size(priority);
+        let shared_high = self.get_sched_pool().high_priority_uses_shared_pool();
+        let running = if shared_high {
+            self.inner.worker_load.total_running()
+        } else if priority == CommandPri::High {
+            self.inner.worker_load.running_high()
+        } else {
+            self.inner.worker_load.running_shared()
+        };
+        total.saturating_sub(running)
     }
 
     fn fail_fast_or_check_deadline(&self, cid: u64, cmd: &Command, tracker_token: TrackerToken) {
@@ -723,6 +845,9 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
         let metadata = TaskMetadata::from_ctx(task.cmd().resource_control_ctx());
         let request_source = task.cmd().ctx().request_source.clone();
         let priority = task.cmd().priority();
+        let worker_load = self.inner.worker_load.clone();
+        let high_shared = self.get_sched_pool().high_priority_uses_shared_pool();
+        let load_class = worker_load.acquire(priority, high_shared);
         let future_tracker =
             TlsFutureTracker::new(task.tracker_token(), task.cmd().tag(), task.cid());
         let execution = async move {
@@ -794,12 +919,14 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
         // NB: Prefer FutureExt::map to async block, because an async block
         // doubles memory usage.
         // See https://github.com/rust-lang/rust/issues/59087
+        let worker_load_clone = worker_load.clone();
         let execution = execution.map(move |_| {
             memory_quota.free(execution_bytes);
             SCHED_TXN_MEMORY_QUOTA
                 .in_use
                 .set(memory_quota.in_use() as i64);
             SCHED_TXN_RUNNING_COMMANDS.dec();
+            worker_load_clone.release(load_class);
         });
         SCHED_TXN_RUNNING_COMMANDS.inc();
         self.get_sched_pool()
@@ -2162,6 +2289,198 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
     }
 }
 
+struct AgentSchedulingThresholds {
+    high: usize,
+    medium: usize,
+    low: usize,
+}
+
+struct AgentSchedulerRuntime {
+    thresholds: AgentSchedulingThresholds,
+    base_delay: Duration,
+    urgency_margin: Duration,
+    queue: StdMutex<BTreeMap<StdInstant, Vec<DelayedWriteRequest>>>,
+    condvar: Condvar,
+    shutdown: AtomicBool,
+    worker_handle: StdMutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl AgentSchedulerRuntime {
+    fn start<E: Engine, L: LockManager>(
+        cfg: AgentSchedulingConfig,
+        scheduler: TxnScheduler<E, L>,
+    ) -> Arc<Self> {
+        let runtime = Arc::new(Self {
+            thresholds: AgentSchedulingThresholds {
+                high: cfg.threshold_high,
+                medium: cfg.threshold_medium,
+                low: cfg.threshold_low,
+            },
+            base_delay: cfg.base_recheck_delay.0,
+            urgency_margin: cfg.urgency_margin.0,
+            queue: StdMutex::new(BTreeMap::new()),
+            condvar: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+            worker_handle: StdMutex::new(None),
+        });
+        let worker_runtime = runtime.clone();
+        let handle = thread::Builder::new()
+            .name(tikv_util::thd_name!("agent-delay"))
+            .spawn(move || worker_runtime.run(scheduler))
+            .expect("failed to start agent scheduling worker");
+        *runtime.worker_handle.lock().unwrap() = Some(handle);
+        runtime
+    }
+
+    fn threshold_for(&self, priority: CommandPri) -> usize {
+        match priority {
+            CommandPri::High => self.thresholds.high,
+            CommandPri::Normal => self.thresholds.medium,
+            CommandPri::Low => self.thresholds.low,
+        }
+    }
+
+    fn urgency_margin(&self) -> Duration {
+        self.urgency_margin
+    }
+
+    fn enqueue(&self, mut request: DelayedWriteRequest) {
+        let now = StdInstant::now();
+        request.next_check_time = self.compute_next_check(now, request.deadline);
+        self.push_request(request);
+    }
+
+    fn push_request(&self, request: DelayedWriteRequest) {
+        let mut queue = self.queue.lock().unwrap();
+        queue
+            .entry(request.next_check_time)
+            .or_default()
+            .push(request);
+        self.condvar.notify_one();
+    }
+
+    fn compute_next_check(&self, now: StdInstant, deadline: StdInstant) -> StdInstant {
+        let next = match now.checked_add(self.base_delay) {
+            Some(ts) => ts,
+            None => deadline,
+        };
+        if next > deadline { deadline } else { next }
+    }
+
+    fn run<E: Engine, L: LockManager>(self: Arc<Self>, scheduler: TxnScheduler<E, L>) {
+        while !self.shutdown.load(Ordering::SeqCst) {
+            let ready = match self.wait_for_ready() {
+                Some(reqs) => reqs,
+                None => break,
+            };
+            for mut req in ready {
+                if self.shutdown.load(Ordering::SeqCst) {
+                    scheduler.schedule_command(req.task, req.callback, req.prepared_latches);
+                    continue;
+                }
+                let now = StdInstant::now();
+                if now + self.urgency_margin >= req.deadline {
+                    scheduler.schedule_command(req.task, req.callback, req.prepared_latches);
+                    continue;
+                }
+                let required = self.threshold_for(req.priority);
+                if required == 0
+                    || scheduler.available_threads_for_priority(req.priority) >= required
+                {
+                    scheduler.schedule_command(req.task, req.callback, req.prepared_latches);
+                } else {
+                    req.next_check_time = self.compute_next_check(now, req.deadline);
+                    self.push_request(req);
+                }
+            }
+        }
+        self.flush_all(&scheduler);
+    }
+
+    fn wait_for_ready(&self) -> Option<Vec<DelayedWriteRequest>> {
+        let mut guard = self.queue.lock().unwrap();
+        loop {
+            if self.shutdown.load(Ordering::SeqCst) {
+                return None;
+            }
+            if let Some((&instant, _)) = guard.iter().next() {
+                let now = StdInstant::now();
+                if now >= instant {
+                    let mut ready = guard.remove(&instant).unwrap();
+                    while let Some((&next_time, _)) = guard.iter().next() {
+                        if StdInstant::now() >= next_time {
+                            if let Some(mut extra) = guard.remove(&next_time) {
+                                ready.append(&mut extra);
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    return Some(ready);
+                }
+                let wait = instant.saturating_duration_since(now);
+                guard = self.condvar.wait_timeout(guard, wait).unwrap().0;
+            } else {
+                guard = self.condvar.wait_timeout(guard, self.base_delay).unwrap().0;
+            }
+        }
+    }
+
+    fn flush_all<E: Engine, L: LockManager>(&self, scheduler: &TxnScheduler<E, L>) {
+        let pending = {
+            let mut queue = self.queue.lock().unwrap();
+            let pending = queue
+                .iter_mut()
+                .flat_map(|(_, requests)| requests.drain(..))
+                .collect::<Vec<_>>();
+            queue.clear();
+            pending
+        };
+        for req in pending {
+            scheduler.schedule_command(req.task, req.callback, req.prepared_latches);
+        }
+    }
+
+}
+
+impl Drop for AgentSchedulerRuntime {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.condvar.notify_all();
+        if let Some(handle) = self.worker_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+struct DelayedWriteRequest {
+    task: Task,
+    callback: SchedulerTaskCallback,
+    prepared_latches: Option<Lock>,
+    priority: CommandPri,
+    deadline: StdInstant,
+    next_check_time: StdInstant,
+}
+
+impl DelayedWriteRequest {
+    fn new(
+        task: Task,
+        callback: SchedulerTaskCallback,
+        prepared_latches: Option<Lock>,
+        deadline: StdInstant,
+    ) -> Self {
+        let priority = task.cmd().priority();
+        Self {
+            task,
+            callback,
+            prepared_latches,
+            priority,
+            deadline,
+            next_check_time: deadline,
+        }
+    }
+}
+
 pub async fn get_raw_ext(
     causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
     concurrency_manager: ConcurrencyManager,
@@ -2241,7 +2560,7 @@ impl SchedulerDetails {
 
 #[cfg(test)]
 mod tests {
-    use std::{assert_matches::assert_matches, thread};
+    use std::{assert_matches::assert_matches, thread, time::Duration};
 
     use futures_executor::block_on;
     use kvproto::kvrpcpb::{
@@ -2249,7 +2568,7 @@ mod tests {
     };
     use raftstore::store::{ReadStats, WriteStats};
     use tikv_util::{
-        config::ReadableSize,
+        config::{ReadableDuration, ReadableSize},
         future::{block_on_timeout, paired_future_callback},
         memory::HeapSize,
     };
@@ -2507,6 +2826,7 @@ mod tests {
         req2.mut_context().max_execution_duration_ms = 10000;
         req2.set_keys(vec![b"a".to_vec(), b"b".to_vec(), b"d".to_vec()].into());
         let cmd2: TypedCommand<()> = req2.into();
+        assert_eq!(cmd2.cmd.ctx().get_busy_threshold_ms(), 50);
         let (cb2, f2) = paired_future_callback();
         scheduler.run_cmd(cmd2.cmd, StorageCallback::Boolean(cb2));
 
@@ -2598,6 +2918,46 @@ mod tests {
         let (cb, f) = paired_future_callback();
         scheduler.run_cmd(cmd.cmd, StorageCallback::TxnStatus(cb));
         block_on(f).unwrap().unwrap();
+    }
+
+    #[test]
+    fn test_agent_schedule_delays_until_capacity_available() {
+        let mut config = Config::default();
+        config.scheduler_worker_pool_size = 1;
+        config.agent_scheduling.enable = true;
+        config.agent_scheduling.threshold_high = 0;
+        config.agent_scheduling.threshold_medium = 1;
+        config.agent_scheduling.threshold_low = 1;
+        config.agent_scheduling.base_recheck_delay = ReadableDuration::millis(5);
+        config.agent_scheduling.urgency_margin = ReadableDuration::millis(1);
+        let (scheduler, _) = new_test_scheduler_with_config(config);
+        assert!(scheduler.agent_scheduler.is_some());
+
+        scheduler
+            .inner
+            .worker_load
+            .shared_running
+            .store(1, Ordering::SeqCst);
+
+        let mut req = BatchRollbackRequest::default();
+        req.set_keys(vec![b"b".to_vec()].into());
+        req.mut_context().set_busy_threshold_ms(50);
+        req.mut_context().set_priority(CommandPri::Low);
+        let cmd: TypedCommand<()> = req.into();
+        assert_eq!(cmd.cmd.ctx().get_busy_threshold_ms(), 50);
+        let (cb, mut fut) = paired_future_callback();
+        scheduler.run_cmd(cmd.cmd, StorageCallback::Boolean(cb));
+
+        thread::sleep(Duration::from_millis(20));
+        assert_matches!(fut.try_recv(), Ok(None));
+
+        scheduler
+            .inner
+            .worker_load
+            .shared_running
+            .store(0, Ordering::SeqCst);
+
+        block_on(fut).unwrap().unwrap();
     }
 
     #[test]
