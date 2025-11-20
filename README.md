@@ -4,12 +4,31 @@ If you just want **TiKV + PD**, without TiDB SQL:
 
 ### Clone/Build TiKV
 
+Prerequisites (macOS):
+```bash
+brew install cmake pkg-config openssl@3 protobuf go
+# If Rust is not installed:
+curl https://sh.rustup.rs -sSf | sh -s -- -y
+source $HOME/.cargo/env
+```
+
 ```bash
 # already in repo root
 # build tikv-server with cmake policy hint (fixes grpc/c-ares cmake check on macOS)
 export CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
 cargo build --bin tikv-server --release
 ```
+
+Build troubleshooting:
+- If you see a CMake error from grpcio-sys/c-ares like “Compatibility with CMake < 3.5 has been removed … or add -DCMAKE_POLICY_VERSION_MINIMUM=3.5 …”, do:
+  ```bash
+  cargo clean
+  export CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+  # Optional: help OpenSSL linking if needed
+  export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:${PKG_CONFIG_PATH}"
+  cargo build --bin tikv-server --release -v
+  ```
+- Ensure you have `cmake` and `pkg-config` installed (see prerequisites above).
 
 ## TiKV always requires at least one PD (Placement Driver)
 
@@ -121,7 +140,7 @@ go build -o bin/csv-ycsb ./cmd/csv-ycsb
 #### 5.2 Run replay (server-side scheduling ON)
 ```bash
 # assuming PD/TiKV are up as above (default API V1)
-./bin/csv-ycsb \
+./go-ycsb/bin/csv-ycsb \
   -csv ./delay_sample_requests.csv \
   -pd 127.0.0.1:2379 \
   -table usertable \
