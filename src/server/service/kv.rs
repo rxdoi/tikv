@@ -446,7 +446,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         RawBatchScanRequest,
         RawBatchScanResponse
     );
-    handle_request!(raw_put, future_raw_put, RawPutRequest, RawPutResponse);
+    // Custom raw_put implemented below to read gRPC metadata for scheduling
     handle_request!(
         raw_batch_put,
         future_raw_batch_put,
@@ -507,6 +507,85 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         BroadcastTxnStatusRequest,
         BroadcastTxnStatusResponse
     );
+
+    // Custom RawPut: read gRPC metadata (x-aaws-*) for scheduling; do not change key/value.
+    fn raw_put(&mut self, ctx: RpcContext<'_>, req: RawPutRequest, sink: UnarySink<RawPutResponse>) {
+        reject_if_cluster_id_mismatch!(req, self, ctx, sink);
+        forward_unary!(self.proxy, raw_put, ctx, req, sink);
+        let headers = ctx.request_headers().clone();
+        let storage = self.storage.clone();
+        let task = async move {
+            use crate::server::service::agent_scheduler::{block_delay_until_sched, inc_running, dec_running, AawsMeta, AawsPriority};
+            // Unpack request
+            let mut req = req;
+            let mut sctx = req.take_context();
+            let cf = req.take_cf();
+            let ttl = req.get_ttl();
+            let for_atomic = req.get_for_cas();
+            let key = req.take_key();
+            let val = req.take_value();
+
+            // Parse metadata
+            let mut pri: Option<AawsPriority> = None;
+            let mut ddl_ms: Option<u64> = None;
+            for i in 0..headers.len() {
+                if let Some((k, v)) = headers.get(i) {
+                    if k == "x-aaws-priority" {
+                        let s = String::from_utf8_lossy(v);
+                        pri = Some(match s.as_ref() {
+                            "H" | "h" | "HIGH" | "high" => AawsPriority::High,
+                            "L" | "l" | "LOW" | "low" => AawsPriority::Low,
+                            _ => AawsPriority::Medium,
+                        });
+                    } else if k == "x-aaws-deadline-ms" {
+                        if let Ok(s) = std::str::from_utf8(v) {
+                            if let Ok(x) = s.parse::<u64>() {
+                                ddl_ms = Some(x);
+                            }
+                        }
+                    }
+                }
+            }
+            if let (Some(p), Some(d)) = (pri, ddl_ms) {
+                let meta = AawsMeta { priority: p, deadline_ms: d, actual_key: key.clone() };
+                block_delay_until_sched(&meta);
+            }
+
+            // Write
+            inc_running();
+            let (cb, fcb) = paired_future_callback();
+            let res = if for_atomic {
+                storage.raw_batch_put_atomic(sctx, cf, vec![(key, val)], vec![ttl], cb)
+            } else {
+                storage.raw_put(sctx, cf, key, val, ttl, cb)
+            };
+            let v = match res {
+                Err(e) => {
+                    dec_running();
+                    Err(e)
+                }
+                Ok(_) => {
+                    let r = fcb.await;
+                    dec_running();
+                    r?
+                }
+            };
+            let mut resp = RawPutResponse::default();
+            if let Some(err) = extract_region_error(&v) {
+                resp.set_region_error(err);
+            } else if let Err(e) = v {
+                resp.set_error(format!("{}", e));
+            }
+            sink.success(resp).await?;
+            ServerResult::Ok(())
+        }
+        .map_err(|e| {
+            log_net_error!(e, "kv rpc failed"; "request" => "raw_put");
+            GRPC_MSG_FAIL_COUNTER.raw_put.inc();
+        })
+        .map(|_| ());
+        ctx.spawn(task);
+    }
 
     fn kv_import(&mut self, _: RpcContext<'_>, _: ImportRequest, _: UnarySink<ImportResponse>) {
         unimplemented!();
@@ -2015,25 +2094,17 @@ fn future_raw_put<E: Engine, L: LockManager, F: KvFormat>(
     storage: &Storage<E, L, F>,
     mut req: RawPutRequest,
 ) -> impl Future<Output = ServerResult<RawPutResponse>> {
-    let (cb, f) = paired_future_callback();
+    let mut ctx = req.take_context();
+    let cf = req.take_cf();
+    let ttl = req.get_ttl();
     let for_atomic = req.get_for_cas();
+    let key = req.take_key();
+    let val = req.take_value();
+    let (cb, f) = paired_future_callback();
     let res = if for_atomic {
-        storage.raw_batch_put_atomic(
-            req.take_context(),
-            req.take_cf(),
-            vec![(req.take_key(), req.take_value())],
-            vec![req.get_ttl()],
-            cb,
-        )
+        storage.raw_batch_put_atomic(ctx, cf, vec![(key, val)], vec![ttl], cb)
     } else {
-        storage.raw_put(
-            req.take_context(),
-            req.take_cf(),
-            req.take_key(),
-            req.take_value(),
-            req.get_ttl(),
-            cb,
-        )
+        storage.raw_put(ctx, cf, key, val, ttl, cb)
     };
 
     async move {

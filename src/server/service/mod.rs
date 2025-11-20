@@ -4,6 +4,7 @@ mod batch;
 mod debug;
 pub mod diagnostics;
 mod kv;
+pub mod agent_scheduler;
 
 pub use self::{
     debug::{ResolvedTsDiagnosisCallback, Service as DebugService},

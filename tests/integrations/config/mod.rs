@@ -141,6 +141,7 @@ fn test_serde_custom_tikv_config() {
             stack_size: ReadableSize::mb(20),
             max_tasks_per_worker: 2200,
             auto_adjust_pool_size: false,
+            cpu_threshold: 0.0,
         },
         storage: StorageReadPoolConfig {
             use_unified_pool: Some(true),
@@ -194,6 +195,7 @@ fn test_serde_custom_tikv_config() {
         raft_log_gc_threshold: 12,
         raft_log_gc_count_limit: Some(12),
         raft_log_gc_size_limit: Some(ReadableSize::kb(1)),
+        raft_read_index_retry_interval_ticks: 123,
         follower_read_max_log_gap: 100,
         raft_log_reserve_max_ticks: 100,
         raft_engine_purge_interval: ReadableDuration::minutes(20),

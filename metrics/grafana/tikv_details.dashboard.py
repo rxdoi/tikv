@@ -3157,6 +3157,20 @@ def YatpPool(
                 metric="tikv_yatp_pool_schedule_wait_duration_bucket",
                 label_selectors=[f'name=~"{pool_name_prefix}.*"'],
             ),
+            graph_panel(
+                title="Running threads",
+                description="The number of concurrently running threads in the yatp thread pool.",
+                targets=[
+                    target(
+                        expr=expr_sum_aggr_over_time(
+                            "tikv_unified_read_pool_thread_count",
+                            "avg",
+                            "1m",
+                        ),
+                        additional_groupby=True,
+                    ),
+                ],
+            ),
         ]
     )
     layout.row(
@@ -3813,6 +3827,12 @@ def Scheduler() -> RowPanel:
                 title="Txn Scheduler Pool Wait Duration",
                 yaxis=yaxis(format=UNITS.SECONDS),
                 metric="tikv_yatp_pool_schedule_wait_duration_bucket",
+                label_selectors=['name=~"sched-worker.*"'],
+            ),
+            heatmap_panel(
+                title="Txn Scheduler Pool Exec Duration",
+                yaxis=yaxis(format=UNITS.SECONDS),
+                metric="tikv_yatp_pool_schedule_exec_duration_bucket",
                 label_selectors=['name=~"sched-worker.*"'],
             ),
         ]

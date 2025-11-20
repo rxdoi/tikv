@@ -1,3 +1,26 @@
+# Build artifacts
+target/
+**/target/
+
+# Local data/logs
+pd-data*
+tikv-data*
+logs/
+
+# Binaries
+pd/bin/
+go-ycsb/bin/
+
+# OS files
+.DS_Store
+
+# Python cache (if any)
+__pycache__/
+*.pyc
+
+# Node/npm (if any)
+node_modules/
+
 
 # OSX leaves these everywhere on SMB shares
 ._*

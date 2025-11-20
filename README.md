@@ -1,3 +1,153 @@
+### 1. TiKV Setup (Local)
+
+If you just want **TiKV + PD**, without TiDB SQL:
+
+### Clone/Build TiKV
+
+```bash
+# already in repo root
+# build tikv-server with cmake policy hint (fixes grpc/c-ares cmake check on macOS)
+export CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+cargo build --bin tikv-server --release
+```
+
+## TiKV always requires at least one PD (Placement Driver)
+
+Use the embedded PD in this repo (already vendored under `pd/`):
+```bash
+cd pd && make && cd ..
+```
+
+This will give you a `pd/bin/pd-server` executable.
+
+---
+
+### 2. Start PD locally (must be running before TiKV)
+Run it on `127.0.0.1:2379` (client port) and `127.0.0.1:2380` (peer port):
+```bash
+./pd/bin/pd-server   --name=pd   --data-dir=pd-data   --client-urls="http://127.0.0.1:2379"   --peer-urls="http://127.0.0.1:2380"   --initial-cluster="pd=http://127.0.0.1:2380"
+```
+
+- `--name=pd` → identifier of the PD node.  
+- `--data-dir=pd-data` → local storage for PD metadata.  
+- `--client-urls` → where clients (like TiKV) connect.  
+- `--peer-urls` → communication between PD nodes (for a cluster, but still needed in standalone).  
+- `--initial-cluster` → bootstrap info (must point to itself in standalone).
+
+---
+
+### 3. Verify PD is running
+Once it’s up, check:
+```bash
+curl http://127.0.0.1:2379/pd/api/v1/members
+```
+
+You should see JSON describing the PD cluster with one member.
+
+---
+
+### 4. Start TiKV and connect to PD
+```bash
+./target/release/tikv-server   --addr="127.0.0.1:20160"   --data-dir=tikv-data   --pd="127.0.0.1:2379"
+```
+
+To restart from a clean state (e.g., after PD re-bootstrap), wipe data directories (or point to new ones):
+```bash
+rm -rf pd-data tikv-data
+```
+
+### 4.1 Clean restart and fixing “duplicated store address”
+
+If you stop and restart TiKV and see a fatal error like:
+
+```
+failed to start raft_server: ... duplicated store address: id:<X> address:"127.0.0.1:20160" ... already registered by id:<Y> ...
+```
+
+it means PD still holds a previous Store record for the same `--addr`/`--status-addr`. Use one of the following approaches:
+
+#### Clean reset (PD + TiKV data)
+This is the simplest way to guarantee a clean cluster (recommended).
+```bash
+# Stop any existing processes
+pkill -TERM tikv-server || true
+pkill -TERM pdsrv || pkill -TERM pd-server || true
+sleep 1
+pkill -9 tikv-server || true
+pkill -9 pdsrv || pkill -9 pd-server || true
+
+# Remove data (run from repo root)
+rm -rf pd-data tikv-data
+mkdir -p logs
+
+# Start PD fresh
+./pd/bin/pd-server --name=pd --data-dir=pd-data \
+  --client-urls="http://127.0.0.1:2379" \
+  --peer-urls="http://127.0.0.1:2380" \
+  --initial-cluster="pd=http://127.0.0.1:2380" > logs/pd.log 2>&1 &
+
+# Wait for PD to be ready
+for i in {1..60}; do sleep 0.5; curl -sf http://127.0.0.1:2379/pd/api/v1/members >/dev/null && break; done
+
+# Start TiKV on 20160
+./target/release/tikv-server --addr=127.0.0.1:20160 \
+  --status-addr=127.0.0.1:20180 \
+  --data-dir=tikv-data \
+  --pd=127.0.0.1:2379 > logs/tikv.log 2>&1 &
+
+```
+
+Note:
+- Ensure the `logs/` directory exists in repo root (the commands above create it).
+- If ports 2379/2380/20160/20180 are in use, stop the other processes first or pick different ports consistently for both PD and TiKV.
+
+---
+
+### 5. CSV Replay (server-side scheduling via gRPC metadata; data-only writes)
+This repository includes a CSV replay tool (in the `go-ycsb` submodule) which replays RawKV writes according to CSV timestamps.  
+- Scheduling metadata (priority/arrival/deadline) is attached as gRPC headers; TiKV reads them and schedules on the server side.  
+- Data plane remains clean: only the original `key/value` is written (no header injection).
+
+#### 5.1 Initialize & build
+```bash
+# initialize submodule
+git submodule update --init --recursive
+
+# build replay tool
+cd go-ycsb
+go build -o bin/csv-ycsb ./cmd/csv-ycsb
+```
+
+#### 5.2 Run replay (server-side scheduling ON)
+```bash
+# assuming PD/TiKV are up as above (default API V1)
+./bin/csv-ycsb \
+  -csv ./delay_sample_requests.csv \
+  -pd 127.0.0.1:2379 \
+  -table usertable \
+  -apiversion V1 \
+  -v \
+  -trace ./replay_trace.csv
+```
+
+Parameters:
+- `-csv`: CSV file path. Required columns: `arrival_time, request_max_delay, priority, key, value`
+- `-pd`: PD endpoints (comma-separated).
+- `-table`: Namespace prefix; final key is `table:key` (for isolation only).
+- `-apiversion`: `V1 | V2` – must match TiKV storage API (default V1).
+- `-v`: Verbose logs.
+- Optional `-max-wait-seconds`: If a request is late by more than this, skip it (default 0 = never skip).
+- Optional `-trace`: Write per-operation trace CSV including arrival/send/done timestamps, delay and latency.
+
+Client-side scheduling (optional baseline):
+- You can disable client-side scheduling with `-no-scheduling` (the server still schedules via headers).
+
+Server-side scheduler knobs (v0 defaults, compiled-in):
+- Worker slots = `8`. Priority thresholds: High=1, Medium=2, Low=4.
+- After arrival, if `now >= arrival + max_delay - 10ms`, the request is urgent and will be sent (still bounded by the max slots). Otherwise it requires `available_slots >= threshold`. If not, it rechecks every `5ms`.
+
+The tool prints go-ycsb style latency stats (AVG/P50/P90/P95/P99/OPS). `Errors: 0` means all writes succeeded.
+
 <img src="images/tikv-logo.png" alt="tikv_logo" width="300"/>
 
 ## [Website](https://tikv.org) | [Documentation](https://tikv.org/docs/latest/concepts/overview/) | [Community Chat](https://slack.tidb.io/invite?team=tikv-wg&channel=general)
