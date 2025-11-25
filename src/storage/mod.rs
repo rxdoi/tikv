@@ -70,8 +70,9 @@ use std::{
         Arc,
         atomic::{self, AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use std::time::Instant as StdInstant;
 
 use api_version::{ApiV1, ApiV2, KeyMode, KvFormat, RawValue};
 use causal_ts::{CausalTsProvider, CausalTsProviderImpl};
@@ -81,6 +82,7 @@ use engine_traits::{
     CF_DEFAULT, CF_LOCK, CF_WRITE, CfName, DATA_CFS, DATA_CFS_LEN, raw_ttl::ttl_to_expire_ts,
 };
 use futures::{future::Either, prelude::*};
+use futures_util::compat::Future01CompatExt;
 use kvproto::{
     kvrpcpb,
     kvrpcpb::{
@@ -126,6 +128,7 @@ pub use self::{
         StorageCallback, TxnStatus,
     },
 };
+use crate::storage::txn::scheduler::RequestSchedulingMetrics;
 use crate::{
     read_pool::{ReadPool, ReadPoolHandle},
     server::{lock_manager::waiter_manager, metrics::ResourcePriority},
@@ -1887,11 +1890,109 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         pri: CommandPri,
         tag: CommandKind,
         future: T,
+        delay_budget_ms: Option<u64>,
     ) -> Result<()>
     where
         T: Future<Output = ()> + Send + 'static,
     {
         SCHED_STAGE_COUNTER_VEC.get(tag).new.inc();
+        
+        // Capture arrival time and request ID for metrics
+        let arrival_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let request_id = self.sched.gen_request_id();
+        let delay_budget = delay_budget_ms.unwrap_or(0);
+        
+        // Check if we should delay this command
+        if let Some(delay_budget_ms_val) = delay_budget_ms {
+            if delay_budget_ms_val > 0 {
+                let delay_budget_duration = Duration::from_millis(delay_budget_ms_val);
+                if let Some(deadline) = self.sched.should_delay_raw_command(pri, delay_budget_duration) {
+                    // Wrap future in delayed execution using timer
+                    let sched = self.sched.clone();
+                    let base_delay = sched.get_agent_base_delay();
+                    let urgency_margin = sched.get_agent_urgency_margin();
+                    let delayed_future = async move {
+                        // Wait until deadline or threads available, checking periodically
+                        let mut next_check = StdInstant::now() + base_delay;
+                        
+                        loop {
+                            let now = StdInstant::now();
+                            
+                            // Urgency check: if deadline is within urgency_margin, execute immediately
+                            if now + urgency_margin >= deadline {
+                                break;
+                            }
+                            
+                            // Check if threads are available
+                            let required = sched.get_agent_threshold_for_priority(pri);
+                            if required == 0 {
+                                break;
+                            }
+                            let available = sched.available_threads_for_priority(pri);
+                            if available >= required {
+                                break;
+                            }
+                            
+                            // Wait until next check time using timer
+                            let wait_time = next_check.saturating_duration_since(now);
+                            if wait_time > Duration::ZERO {
+                                let timer = tikv_util::timer::GLOBAL_TIMER_HANDLE.delay(std::time::Instant::now() + wait_time);
+                                timer.compat().await.unwrap();
+                            }
+                            next_check = StdInstant::now() + base_delay;
+                        }
+                        
+                        // Record metrics when finally executing
+                        let scheduled_time = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64;
+                        let scheduling_delay = scheduled_time.saturating_sub(arrival_time);
+                        let available_threads = sched.available_threads_for_priority(pri);
+                        
+                        let metrics = RequestSchedulingMetrics {
+                            request_id,
+                            delay_budget_ms: delay_budget,
+                            arrival_time_ms: arrival_time,
+                            scheduled_time_ms: scheduled_time,
+                            scheduling_delay_ms: scheduling_delay,
+                            available_threads,
+                        };
+                        sched.record_scheduling_metrics(metrics);
+                        
+                        // Execute the original future
+                        future.await;
+                    };
+                    
+                    return self.sched
+                        .get_sched_pool()
+                        .spawn("", metadata, pri, delayed_future)
+                        .map_err(|_| Error::from(ErrorInner::SchedTooBusy));
+                }
+            }
+        }
+        
+        // Record metrics for immediate execution
+        let scheduled_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let scheduling_delay = scheduled_time.saturating_sub(arrival_time);
+        let available_threads = self.sched.available_threads_for_priority(pri);
+        
+        let metrics = RequestSchedulingMetrics {
+            request_id,
+            delay_budget_ms: delay_budget,
+            arrival_time_ms: arrival_time,
+            scheduled_time_ms: scheduled_time,
+            scheduling_delay_ms: scheduling_delay,
+            available_threads,
+        };
+        self.sched.record_scheduling_metrics(metrics);
+        
         self.sched
             .get_sched_pool()
             // NOTE: we don't support background resource control for raw api.
@@ -2372,6 +2473,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
 
         let priority = ctx.get_priority();
         let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let delay_budget_ms = if ctx.busy_threshold_ms > 0 {
+            Some(ctx.busy_threshold_ms as u64)
+        } else {
+            None
+        };
         self.sched_raw_command(metadata, priority, CMD, async move {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
@@ -2414,7 +2520,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             SCHED_HISTOGRAM_VEC_STATIC
                 .get(CMD)
                 .observe(command_duration.saturating_elapsed().as_secs_f64());
-        })
+        }, delay_budget_ms)
     }
 
     fn check_ttl_valid(key_cnt: usize, ttls: &[u64]) -> Result<()> {
@@ -2484,6 +2590,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let deadline = Self::get_deadline(&ctx);
         let priority = ctx.get_priority();
         let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let delay_budget_ms = if ctx.busy_threshold_ms > 0 {
+            Some(ctx.busy_threshold_ms as u64)
+        } else {
+            None
+        };
         self.sched_raw_command(metadata, priority, CMD, async move {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
@@ -2517,7 +2628,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             SCHED_HISTOGRAM_VEC_STATIC
                 .get(CMD)
                 .observe(command_duration.saturating_elapsed().as_secs_f64());
-        })
+        }, delay_budget_ms)
     }
 
     fn raw_delete_request_to_modify(cf: CfName, key: Vec<u8>, ts: Option<TimeStamp>) -> Modify {
@@ -2549,6 +2660,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let deadline = Self::get_deadline(&ctx);
         let priority = ctx.get_priority();
         let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let delay_budget_ms = if ctx.busy_threshold_ms > 0 {
+            Some(ctx.busy_threshold_ms as u64)
+        } else {
+            None
+        };
         self.sched_raw_command(metadata, priority, CMD, async move {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
@@ -2581,7 +2697,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             SCHED_HISTOGRAM_VEC_STATIC
                 .get(CMD)
                 .observe(command_duration.saturating_elapsed().as_secs_f64());
-        })
+        }, delay_budget_ms)
     }
 
     /// Delete all raw keys in [`start_key`, `end_key`).
@@ -2610,6 +2726,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let deadline = Self::get_deadline(&ctx);
         let priority = ctx.get_priority();
         let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let delay_budget_ms = if ctx.busy_threshold_ms > 0 {
+            Some(ctx.busy_threshold_ms as u64)
+        } else {
+            None
+        };
         self.sched_raw_command(metadata, priority, CMD, async move {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
@@ -2634,7 +2755,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             SCHED_HISTOGRAM_VEC_STATIC
                 .get(CMD)
                 .observe(command_duration.saturating_elapsed().as_secs_f64());
-        })
+        }, delay_budget_ms)
     }
 
     /// Delete some raw keys in a batch.
@@ -2658,6 +2779,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let deadline = Self::get_deadline(&ctx);
         let priority = ctx.get_priority();
         let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let delay_budget_ms = if ctx.busy_threshold_ms > 0 {
+            Some(ctx.busy_threshold_ms as u64)
+        } else {
+            None
+        };
         self.sched_raw_command(metadata, priority, CMD, async move {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
@@ -2694,7 +2820,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             SCHED_HISTOGRAM_VEC_STATIC
                 .get(CMD)
                 .observe(command_duration.saturating_elapsed().as_secs_f64());
-        })
+        }, delay_budget_ms)
     }
 
     /// Scan raw keys in a range.
@@ -3123,11 +3249,16 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let sched = self.get_scheduler();
         let priority = ctx.get_priority();
         let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let delay_budget_ms = if ctx.busy_threshold_ms > 0 {
+            Some(ctx.busy_threshold_ms as u64)
+        } else {
+            None
+        };
         self.sched_raw_command(metadata, priority, CMD, async move {
             let key = F::encode_raw_key_owned(key, None);
             let cmd = RawCompareAndSwap::new(cf, key, previous_value, value, ttl, api_version, ctx);
             Self::sched_raw_atomic_command(sched, cmd, Box::new(|res| callback(res)));
-        })
+        }, delay_budget_ms)
     }
 
     pub fn raw_batch_put_atomic(
@@ -3152,11 +3283,16 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let sched = self.get_scheduler();
         let priority = ctx.get_priority();
         let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let delay_budget_ms = if ctx.busy_threshold_ms > 0 {
+            Some(ctx.busy_threshold_ms as u64)
+        } else {
+            None
+        };
         self.sched_raw_command(metadata, priority, CMD, async move {
             let modifies = Self::raw_batch_put_requests_to_modifies(cf, pairs, ttls, None);
             let cmd = RawAtomicStore::new(cf, modifies, ctx);
             Self::sched_raw_atomic_command(sched, cmd, Box::new(|res| callback(res)));
-        })
+        }, delay_budget_ms)
     }
 
     pub fn raw_batch_delete_atomic(
@@ -3173,6 +3309,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let sched = self.get_scheduler();
         let priority = ctx.get_priority();
         let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let delay_budget_ms = if ctx.busy_threshold_ms > 0 {
+            Some(ctx.busy_threshold_ms as u64)
+        } else {
+            None
+        };
         self.sched_raw_command(metadata, priority, CMD, async move {
             // Do NOT encode ts here as RawAtomicStore use key to gen lock
             let modifies = keys
@@ -3181,7 +3322,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 .collect();
             let cmd = RawAtomicStore::new(cf, modifies, ctx);
             Self::sched_raw_atomic_command(sched, cmd, Box::new(|res| callback(res)));
-        })
+        }, delay_budget_ms)
     }
 
     pub fn raw_checksum(
@@ -3322,6 +3463,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         const CMD: CommandKind = CommandKind::update_txn_status_cache;
         let priority = ctx.get_priority();
         let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let delay_budget_ms = if ctx.busy_threshold_ms > 0 {
+            Some(ctx.busy_threshold_ms as u64)
+        } else {
+            None
+        };
         let cache = self.get_scheduler().get_txn_status_cache();
         let f = async move {
             let now = SystemTime::now();
@@ -3342,7 +3488,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             }
             callback(Ok(()));
         };
-        self.sched_raw_command(metadata, priority, CMD, f)
+        self.sched_raw_command(metadata, priority, CMD, f, delay_budget_ms)
     }
 }
 

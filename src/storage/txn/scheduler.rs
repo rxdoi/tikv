@@ -787,7 +787,7 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
         Some(deadline)
     }
 
-    fn available_threads_for_priority(&self, priority: CommandPri) -> usize {
+    pub fn available_threads_for_priority(&self, priority: CommandPri) -> usize {
         let total = self.get_sched_pool().get_pool_size(priority);
         let shared_high = self.get_sched_pool().high_priority_uses_shared_pool();
         let running = if shared_high {
@@ -801,7 +801,7 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
     }
 
     /// Record scheduling metrics
-    fn record_scheduling_metrics(&self, metrics: RequestSchedulingMetrics) {
+    pub fn record_scheduling_metrics(&self, metrics: RequestSchedulingMetrics) {
         let mut guard = self.inner.request_metrics.lock().unwrap();
         guard.push(metrics);
     }
@@ -839,6 +839,64 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
     /// Generate a new request ID for metrics tracking
     pub fn gen_request_id(&self) -> u64 {
         self.inner.gen_id()
+    }
+
+    /// Check if a raw command should be delayed based on thread availability
+    pub fn should_delay_raw_command(
+        &self,
+        priority: CommandPri,
+        delay_budget: Duration,
+    ) -> Option<StdInstant> {
+        if let Some(runtime) = &self.agent_scheduler {
+            let required = runtime.threshold_for(priority);
+            if required == 0 {
+                return None;
+            }
+            let available = self.available_threads_for_priority(priority);
+            if available >= required {
+                return None;
+            }
+
+            let now = StdInstant::now();
+            let agent_deadline = match now.checked_add(delay_budget) {
+                Some(deadline) => deadline,
+                None => return None,
+            };
+            
+            if now + runtime.urgency_margin() >= agent_deadline {
+                return None;
+            }
+            Some(agent_deadline)
+        } else {
+            None
+        }
+    }
+
+    /// Get the threshold for a given priority (for raw commands)
+    pub fn get_agent_threshold_for_priority(&self, priority: CommandPri) -> usize {
+        if let Some(runtime) = &self.agent_scheduler {
+            runtime.threshold_for(priority)
+        } else {
+            0
+        }
+    }
+
+    /// Get the base delay for agentic scheduler (for raw commands)
+    pub fn get_agent_base_delay(&self) -> Duration {
+        if let Some(runtime) = &self.agent_scheduler {
+            runtime.base_delay()
+        } else {
+            Duration::from_millis(5)
+        }
+    }
+
+    /// Get the urgency margin for agentic scheduler (for raw commands)
+    pub fn get_agent_urgency_margin(&self) -> Duration {
+        if let Some(runtime) = &self.agent_scheduler {
+            runtime.urgency_margin()
+        } else {
+            Duration::from_millis(10)
+        }
     }
 
     fn fail_fast_or_check_deadline(&self, cid: u64, cmd: &Command, tracker_token: TrackerToken) {
@@ -2456,6 +2514,10 @@ impl AgentSchedulerRuntime {
 
     fn urgency_margin(&self) -> Duration {
         self.urgency_margin
+    }
+
+    fn base_delay(&self) -> Duration {
+        self.base_delay
     }
 
     fn enqueue(&self, mut request: DelayedWriteRequest) {
