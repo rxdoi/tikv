@@ -33,7 +33,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
-    time::{Duration, Instant as StdInstant},
+    time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
 
 use causal_ts::CausalTsProviderImpl;
@@ -286,6 +286,17 @@ impl From<StorageCallback> for SchedulerTaskCallback {
     }
 }
 
+// Request scheduling metrics for tracking and analysis
+#[derive(Debug, Clone)]
+pub struct RequestSchedulingMetrics {
+    pub request_id: u64,
+    pub delay_budget_ms: u64,
+    pub arrival_time_ms: u64,
+    pub scheduled_time_ms: u64,
+    pub scheduling_delay_ms: u64,
+    pub available_threads: usize,
+}
+
 struct TxnSchedulerInner<L: LockManager> {
     // slot_id -> { cid -> `TaskContext` } in the slot.
     task_slots: Vec<CachePadded<Mutex<HashMap<u64, TaskContext>>>>,
@@ -337,6 +348,9 @@ struct TxnSchedulerInner<L: LockManager> {
     in_memory_peer_size_limit: Arc<AtomicU64>,
     in_memory_instance_size_limit: Arc<AtomicU64>,
     worker_load: Arc<WorkerLoad>,
+    
+    // Metrics for request scheduling
+    request_metrics: StdMutex<Vec<RequestSchedulingMetrics>>,
 }
 
 #[inline]
@@ -535,6 +549,7 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
             in_memory_peer_size_limit: dynamic_configs.in_memory_peer_size_limit,
             in_memory_instance_size_limit: dynamic_configs.in_memory_instance_size_limit,
             worker_load: Arc::new(WorkerLoad::default()),
+            request_metrics: StdMutex::new(Vec::new()),
         });
 
         SCHED_TXN_MEMORY_QUOTA
@@ -593,7 +608,20 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
             Self::fail_with_busy(tag, callback.into());
             return;
         }
-        let cid = self.inner.gen_id();
+        
+        // Capture arrival time and request ID for metrics
+        let arrival_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let request_id = self.inner.gen_id();
+        let delay_budget_ms = if cmd.ctx().busy_threshold_ms > 0 {
+            cmd.ctx().busy_threshold_ms as u64
+        } else {
+            0
+        };
+        
+        let cid = request_id;
         if let Ok(task) = Task::allocate(cid, cmd, self.inner.memory_quota.clone()) {
             let sched_cb = SchedulerTaskCallback::NormalRequestCallback(callback);
             if let Some(runtime) = &self.agent_scheduler {
@@ -601,12 +629,16 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
                     if let Some(deadline) =
                         self.should_delay_task(task.cmd(), runtime, delay_budget)
                     {
-                        runtime.enqueue(DelayedWriteRequest::new(task, sched_cb, None, deadline));
+                        // Store arrival time and request info for delayed commands
+                        // Metrics will be recorded when the command is finally scheduled
+                        runtime.enqueue(DelayedWriteRequest::new(
+                            task, sched_cb, None, deadline, request_id, arrival_time, delay_budget_ms
+                        ));
                         return;
                     }
                 }
             }
-            self.schedule_command(task, sched_cb, None);
+            self.schedule_command_with_metrics(task, sched_cb, None, request_id, delay_budget_ms, arrival_time);
         } else {
             Self::fail_with_busy(tag, callback.into());
         }
@@ -634,10 +666,51 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
         callback: SchedulerTaskCallback,
         prepared_latches: Option<Lock>,
     ) {
+        // For commands scheduled directly (not from run_cmd), use current time as arrival
+        let arrival_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let request_id = task.cid();
+        let delay_budget_ms = if task.cmd().ctx().busy_threshold_ms > 0 {
+            task.cmd().ctx().busy_threshold_ms as u64
+        } else {
+            0
+        };
+        self.schedule_command_with_metrics(task, callback, prepared_latches, request_id, delay_budget_ms, arrival_time);
+    }
+
+    fn schedule_command_with_metrics(
+        &self,
+        task: Task,
+        callback: SchedulerTaskCallback,
+        prepared_latches: Option<Lock>,
+        request_id: u64,
+        delay_budget_ms: u64,
+        arrival_time_ms: u64,
+    ) {
         let cid = task.cid();
         let tracker_token = task.tracker_token();
         let cmd = task.cmd();
         debug!("received new command"; "cid" => cid, "cmd" => ?cmd, "tracker" => ?tracker_token);
+
+        // Record scheduled time and metrics
+        let scheduled_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let scheduling_delay = scheduled_time.saturating_sub(arrival_time_ms);
+        let available_threads = self.available_threads_for_priority(cmd.priority());
+        
+        let metrics = RequestSchedulingMetrics {
+            request_id,
+            delay_budget_ms,
+            arrival_time_ms,
+            scheduled_time_ms: scheduled_time,
+            scheduling_delay_ms: scheduling_delay,
+            available_threads,
+        };
+        self.record_scheduling_metrics(metrics);
 
         let tag = cmd.tag();
         let priority_tag = get_priority_tag(cmd.priority());
@@ -725,6 +798,47 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
             self.inner.worker_load.running_shared()
         };
         total.saturating_sub(running)
+    }
+
+    /// Record scheduling metrics
+    fn record_scheduling_metrics(&self, metrics: RequestSchedulingMetrics) {
+        let mut guard = self.inner.request_metrics.lock().unwrap();
+        guard.push(metrics);
+    }
+
+    /// Get all collected metrics
+    pub fn get_metrics(&self) -> Vec<RequestSchedulingMetrics> {
+        let guard = self.inner.request_metrics.lock().unwrap();
+        guard.clone()
+    }
+
+    /// Clear all collected metrics
+    pub fn clear_metrics(&self) {
+        let mut guard = self.inner.request_metrics.lock().unwrap();
+        guard.clear();
+    }
+
+    /// Export metrics to CSV format
+    pub fn export_metrics_to_csv(&self) -> String {
+        let metrics = self.get_metrics();
+        let mut csv = String::from("Request ID,Delay Budget (ms),Arrival Time (ms),Scheduled Time (ms),Scheduling Delay (ms),Available Threads\n");
+        for m in metrics {
+            csv.push_str(&format!(
+                "{},{},{},{},{},{}\n",
+                m.request_id,
+                m.delay_budget_ms,
+                m.arrival_time_ms,
+                m.scheduled_time_ms,
+                m.scheduling_delay_ms,
+                m.available_threads
+            ));
+        }
+        csv
+    }
+
+    /// Generate a new request ID for metrics tracking
+    pub fn gen_request_id(&self) -> u64 {
+        self.inner.gen_id()
     }
 
     fn fail_fast_or_check_deadline(&self, cid: u64, cmd: &Command, tracker_token: TrackerToken) {
@@ -2375,19 +2489,28 @@ impl AgentSchedulerRuntime {
             };
             for mut req in ready {
                 if self.shutdown.load(Ordering::SeqCst) {
-                    scheduler.schedule_command(req.task, req.callback, req.prepared_latches);
+                    scheduler.schedule_command_with_metrics(
+                        req.task, req.callback, req.prepared_latches,
+                        req.request_id, req.delay_budget_ms, req.arrival_time_ms
+                    );
                     continue;
                 }
                 let now = StdInstant::now();
                 if now + self.urgency_margin >= req.deadline {
-                    scheduler.schedule_command(req.task, req.callback, req.prepared_latches);
+                    scheduler.schedule_command_with_metrics(
+                        req.task, req.callback, req.prepared_latches,
+                        req.request_id, req.delay_budget_ms, req.arrival_time_ms
+                    );
                     continue;
                 }
                 let required = self.threshold_for(req.priority);
                 if required == 0
                     || scheduler.available_threads_for_priority(req.priority) >= required
                 {
-                    scheduler.schedule_command(req.task, req.callback, req.prepared_latches);
+                    scheduler.schedule_command_with_metrics(
+                        req.task, req.callback, req.prepared_latches,
+                        req.request_id, req.delay_budget_ms, req.arrival_time_ms
+                    );
                 } else {
                     req.next_check_time = self.compute_next_check(now, req.deadline);
                     self.push_request(req);
@@ -2437,7 +2560,10 @@ impl AgentSchedulerRuntime {
             pending
         };
         for req in pending {
-            scheduler.schedule_command(req.task, req.callback, req.prepared_latches);
+            scheduler.schedule_command_with_metrics(
+                req.task, req.callback, req.prepared_latches,
+                req.request_id, req.delay_budget_ms, req.arrival_time_ms
+            );
         }
     }
 
@@ -2460,6 +2586,9 @@ struct DelayedWriteRequest {
     priority: CommandPri,
     deadline: StdInstant,
     next_check_time: StdInstant,
+    request_id: u64,
+    arrival_time_ms: u64,
+    delay_budget_ms: u64,
 }
 
 impl DelayedWriteRequest {
@@ -2468,6 +2597,9 @@ impl DelayedWriteRequest {
         callback: SchedulerTaskCallback,
         prepared_latches: Option<Lock>,
         deadline: StdInstant,
+        request_id: u64,
+        arrival_time_ms: u64,
+        delay_budget_ms: u64,
     ) -> Self {
         let priority = task.cmd().priority();
         Self {
@@ -2477,6 +2609,9 @@ impl DelayedWriteRequest {
             priority,
             deadline,
             next_check_time: deadline,
+            request_id,
+            arrival_time_ms,
+            delay_budget_ms,
         }
     }
 }
