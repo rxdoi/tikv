@@ -145,8 +145,7 @@ go build -o bin/csv-ycsb ./cmd/csv-ycsb
   -pd 127.0.0.1:2379 \
   -table usertable \
   -apiversion V1 \
-  -v \
-  -trace ./replay_trace.csv
+  -v
 ```
 
 Parameters:
@@ -156,7 +155,7 @@ Parameters:
 - `-apiversion`: `V1 | V2` – must match TiKV storage API (default V1).
 - `-v`: Verbose logs.
 - Optional `-max-wait-seconds`: If a request is late by more than this, skip it (default 0 = never skip).
-- Optional `-trace`: Write per-operation trace CSV including arrival/send/done timestamps, delay and latency.
+- Optional client trace `-trace`: Writes client-side timestamps (arrival/send/done). If you want detailed server-side scheduling trace (below), omit `-trace` to avoid confusion.
 
 Client-side scheduling (optional baseline):
 - You can disable client-side scheduling with `-no-scheduling` (the server still schedules via headers).
@@ -166,6 +165,27 @@ Server-side scheduler knobs (v0 defaults, compiled-in):
 - After arrival, if `now >= arrival + max_delay - 10ms`, the request is urgent and will be sent (still bounded by the max slots). Otherwise it requires `available_slots >= threshold`. If not, it rechecks every `5ms`.
 
 The tool prints go-ycsb style latency stats (AVG/P50/P90/P95/P99/OPS). `Errors: 0` means all writes succeeded.
+
+#### 5.3 Server-side scheduling trace CSV (written by TiKV)
+TiKV now emits a server-side scheduling trace that is continuously refreshed every ~10ms:
+```text
+./replay_trace.csv
+```
+Columns:
+- `request_id`: Unique identifier (from `x-aaws-request-id` header, or synthesized).
+- `priority`: HIGH | MEDIUM | LOW.
+- `arrival_time_ms`: When the server received the request (or from header if present).
+- `deadline_ms`: Absolute deadline from header.
+- `delay_budget_ms`: `deadline_ms - arrival_time_ms`.
+- `scheduled_time_ms`: When the server admitted the request to run.
+- `scheduling_delay_ms`: `scheduled_time_ms - arrival_time_ms`.
+- `available_threads_at_schedule`: Available virtual slots at scheduling time.
+- `required_threads`: Threshold required by priority.
+- `decision`: `immediate` if admitted with 0 delay; otherwise `delayed`.
+
+Notes:
+- The CSV is rewritten atomically in-place for a consistent snapshot. If you need a final snapshot after a run, copy it after replay completes.
+- To align server/client views, ensure your machine clock is consistent (single-host runs are fine).
 
 <img src="images/tikv-logo.png" alt="tikv_logo" width="300"/>
 

@@ -515,7 +515,18 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         let headers = ctx.request_headers().clone();
         let storage = self.storage.clone();
         let task = async move {
-            use crate::server::service::agent_scheduler::{block_delay_until_sched, inc_running, dec_running, AawsMeta, AawsPriority};
+            use crate::server::service::agent_scheduler::{
+                block_delay_until_sched, inc_running, dec_running, AawsMeta, AawsPriority,
+                ensure_trace_writer_started, available_threads, required_threads_for_priority,
+                record_scheduling_event, AawsSchedRecord,
+            };
+            use std::time::{SystemTime, UNIX_EPOCH};
+            fn now_ms() -> u64 {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+            }
             // Unpack request
             let mut req = req;
             let mut sctx = req.take_context();
@@ -525,9 +536,14 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
             let key = req.take_key();
             let val = req.take_value();
 
+            // Ensure background CSV writer is running
+            ensure_trace_writer_started();
+
             // Parse metadata
             let mut pri: Option<AawsPriority> = None;
             let mut ddl_ms: Option<u64> = None;
+            let mut arr_ms: Option<u64> = None;
+            let mut req_id: Option<String> = None;
             for i in 0..headers.len() {
                 if let Some((k, v)) = headers.get(i) {
                     if k == "x-aaws-priority" {
@@ -543,12 +559,58 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
                                 ddl_ms = Some(x);
                             }
                         }
+                    } else if k == "x-aaws-arrival-ms" {
+                        if let Ok(s) = std::str::from_utf8(v) {
+                            if let Ok(x) = s.parse::<u64>() {
+                                arr_ms = Some(x);
+                            }
+                        }
+                    } else if k == "x-aaws-request-id" {
+                        // treat as opaque UTF-8 string
+                        let s = String::from_utf8_lossy(v).to_string();
+                        if !s.is_empty() {
+                            req_id = Some(s);
+                        }
                     }
                 }
             }
-            if let (Some(p), Some(d)) = (pri, ddl_ms) {
+            let now_recv_ms = now_ms();
+            let arrival_time_ms = arr_ms.unwrap_or(now_recv_ms);
+            let (mut parsed_pri, mut parsed_deadline) = (pri, ddl_ms);
+            if let (Some(p), Some(d)) = (parsed_pri, parsed_deadline) {
                 let meta = AawsMeta { priority: p, deadline_ms: d, actual_key: key.clone() };
+                // Delay until scheduling permitted
                 block_delay_until_sched(&meta);
+                // Scheduled moment
+                let scheduled_time_ms = now_ms();
+                let avail = available_threads();
+                let required = required_threads_for_priority(p);
+                let scheduling_delay_ms = scheduled_time_ms.saturating_sub(arrival_time_ms);
+                let decision: &'static str = if scheduling_delay_ms > 0 { "delayed" } else { "immediate" };
+                // Compute request id if not provided
+                let rid = req_id.unwrap_or_else(|| {
+                    // synthesize from times and key prefix to be stable enough
+                    let mut hex = String::new();
+                    for b in key.iter().take(8) {
+                        use std::fmt::Write as _;
+                        let _ = write!(&mut hex, "{:02x}", b);
+                    }
+                    format!("auto:{}:{}:{}", arrival_time_ms, d, hex)
+                });
+                let delay_budget_ms = d.saturating_sub(arrival_time_ms);
+                // Record event
+                record_scheduling_event(AawsSchedRecord{
+                    request_id: rid,
+                    priority: p,
+                    arrival_time_ms,
+                    deadline_ms: d,
+                    delay_budget_ms,
+                    scheduled_time_ms,
+                    scheduling_delay_ms,
+                    available_threads_at_schedule: avail,
+                    required_threads: required,
+                    decision,
+                });
             }
 
             // Write
