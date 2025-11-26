@@ -447,12 +447,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         RawBatchScanResponse
     );
     // Custom raw_put implemented below to read gRPC metadata for scheduling
-    handle_request!(
-        raw_batch_put,
-        future_raw_batch_put,
-        RawBatchPutRequest,
-        RawBatchPutResponse
-    );
+    // Custom raw_batch_put implemented below to schedule via gRPC headers before forwarding
     handle_request!(
         raw_delete,
         future_raw_delete,
@@ -511,35 +506,18 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
     // Custom RawPut: read gRPC metadata (x-aaws-*) for scheduling; do not change key/value.
     fn raw_put(&mut self, ctx: RpcContext<'_>, req: RawPutRequest, sink: UnarySink<RawPutResponse>) {
         reject_if_cluster_id_mismatch!(req, self, ctx, sink);
-        forward_unary!(self.proxy, raw_put, ctx, req, sink);
+        // Server-side scheduling BEFORE potential forwarding, so forwarded calls are also delayed properly.
         let headers = ctx.request_headers().clone();
-        let storage = self.storage.clone();
-        let task = async move {
+        {
             use crate::server::service::agent_scheduler::{
-                block_delay_until_sched, inc_running, dec_running, AawsMeta, AawsPriority,
-                ensure_trace_writer_started, available_threads, required_threads_for_priority,
-                record_scheduling_event, AawsSchedRecord,
+                ensure_trace_writer_started, block_delay_until_sched, AawsMeta, AawsPriority,
             };
             use std::time::{SystemTime, UNIX_EPOCH};
             fn now_ms() -> u64 {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
             }
-            // Unpack request
-            let mut req = req;
-            let mut sctx = req.take_context();
-            let cf = req.take_cf();
-            let ttl = req.get_ttl();
-            let for_atomic = req.get_for_cas();
-            let key = req.take_key();
-            let val = req.take_value();
-
-            // Ensure background CSV writer is running
             ensure_trace_writer_started();
-
-            // Parse metadata
+            // Parse metadata from incoming headers
             let mut pri: Option<AawsPriority> = None;
             let mut ddl_ms: Option<u64> = None;
             let mut arr_ms: Option<u64> = None;
@@ -566,7 +544,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
                             }
                         }
                     } else if k == "x-aaws-request-id" {
-                        // treat as opaque UTF-8 string
                         let s = String::from_utf8_lossy(v).to_string();
                         if !s.is_empty() {
                             req_id = Some(s);
@@ -574,44 +551,46 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
                     }
                 }
             }
-            let now_recv_ms = now_ms();
-            let arrival_time_ms = arr_ms.unwrap_or(now_recv_ms);
-            let (mut parsed_pri, mut parsed_deadline) = (pri, ddl_ms);
-            if let (Some(p), Some(d)) = (parsed_pri, parsed_deadline) {
-                let meta = AawsMeta { priority: p, deadline_ms: d, actual_key: key.clone() };
-                // Delay until scheduling permitted
-                block_delay_until_sched(&meta);
-                // Scheduled moment
-                let scheduled_time_ms = now_ms();
-                let avail = available_threads();
-                let required = required_threads_for_priority(p);
-                let scheduling_delay_ms = scheduled_time_ms.saturating_sub(arrival_time_ms);
-                let decision: &'static str = if scheduling_delay_ms > 0 { "delayed" } else { "immediate" };
-                // Compute request id if not provided
-                let rid = req_id.unwrap_or_else(|| {
-                    // synthesize from times and key prefix to be stable enough
+            if let (Some(p), Some(d)) = (pri, ddl_ms) {
+                let now_recv_ms = now_ms();
+                let arrival_time_ms = arr_ms.unwrap_or(now_recv_ms);
+                let key_preview = {
+                    // Peek key without consuming req
+                    let k = req.get_key();
                     let mut hex = String::new();
-                    for b in key.iter().take(8) {
+                    for b in k.iter().take(8) {
                         use std::fmt::Write as _;
                         let _ = write!(&mut hex, "{:02x}", b);
                     }
-                    format!("auto:{}:{}:{}", arrival_time_ms, d, hex)
-                });
+                    hex
+                };
+                let rid = req_id.unwrap_or_else(|| format!("auto:{}:{}:{}", arrival_time_ms, d, key_preview));
                 let delay_budget_ms = d.saturating_sub(arrival_time_ms);
-                // Record event
-                record_scheduling_event(AawsSchedRecord{
-                    request_id: rid,
+                let meta = AawsMeta {
                     priority: p,
-                    arrival_time_ms,
                     deadline_ms: d,
+                    actual_key: Vec::new(),
+                    request_id: rid,
+                    arrival_time_ms,
                     delay_budget_ms,
-                    scheduled_time_ms,
-                    scheduling_delay_ms,
-                    available_threads_at_schedule: avail,
-                    required_threads: required,
-                    decision,
-                });
+                };
+                // Block here until scheduled (records per-check inside).
+                block_delay_until_sched(&meta);
             }
+        }
+        // After local scheduling, forward if needed (or handle locally).
+        forward_unary!(self.proxy, raw_put, ctx, req, sink);
+        let storage = self.storage.clone();
+        let task = async move {
+            use crate::server::service::agent_scheduler::{inc_running, dec_running};
+            // Unpack request
+            let mut req = req;
+            let mut sctx = req.take_context();
+            let cf = req.take_cf();
+            let ttl = req.get_ttl();
+            let for_atomic = req.get_for_cas();
+            let key = req.take_key();
+            let val = req.take_value();
 
             // Write
             inc_running();
@@ -644,6 +623,104 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         .map_err(|e| {
             log_net_error!(e, "kv rpc failed"; "request" => "raw_put");
             GRPC_MSG_FAIL_COUNTER.raw_put.inc();
+        })
+        .map(|_| ());
+        ctx.spawn(task);
+    }
+
+    // Custom RawBatchPut: schedule via gRPC metadata before potential forwarding, then execute.
+    fn raw_batch_put(
+        &mut self,
+        ctx: RpcContext<'_>,
+        req: RawBatchPutRequest,
+        sink: UnarySink<RawBatchPutResponse>,
+    ) {
+        reject_if_cluster_id_mismatch!(req, self, ctx, sink);
+        // Pre-scheduling at entry
+        let headers = ctx.request_headers().clone();
+        {
+            use crate::server::service::agent_scheduler::{
+                ensure_trace_writer_started, block_delay_until_sched, AawsMeta, AawsPriority,
+            };
+            use std::time::{SystemTime, UNIX_EPOCH};
+            fn now_ms() -> u64 {
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+            }
+            ensure_trace_writer_started();
+            let mut pri: Option<AawsPriority> = None;
+            let mut ddl_ms: Option<u64> = None;
+            let mut arr_ms: Option<u64> = None;
+            let mut req_id: Option<String> = None;
+            for i in 0..headers.len() {
+                if let Some((k, v)) = headers.get(i) {
+                    if k == "x-aaws-priority" {
+                        let s = String::from_utf8_lossy(v);
+                        pri = Some(match s.as_ref() {
+                            "H" | "h" | "HIGH" | "high" => AawsPriority::High,
+                            "L" | "l" | "LOW" | "low" => AawsPriority::Low,
+                            _ => AawsPriority::Medium,
+                        });
+                    } else if k == "x-aaws-deadline-ms" {
+                        if let Ok(s) = std::str::from_utf8(v) {
+                            if let Ok(x) = s.parse::<u64>() {
+                                ddl_ms = Some(x);
+                            }
+                        }
+                    } else if k == "x-aaws-arrival-ms" {
+                        if let Ok(s) = std::str::from_utf8(v) {
+                            if let Ok(x) = s.parse::<u64>() {
+                                arr_ms = Some(x);
+                            }
+                        }
+                    } else if k == "x-aaws-request-id" {
+                        let s = String::from_utf8_lossy(v).to_string();
+                        if !s.is_empty() {
+                            req_id = Some(s);
+                        }
+                    }
+                }
+            }
+            if let (Some(p), Some(d)) = (pri, ddl_ms) {
+                let now_recv_ms = now_ms();
+                let arrival_time_ms = arr_ms.unwrap_or(now_recv_ms);
+                // Peek first key for ID synthesis
+                let key_preview = {
+                    let pairs = req.get_pairs();
+                    let mut hex = String::new();
+                    if let Some(first) = pairs.get(0) {
+                        for b in first.get_key().iter().take(8) {
+                            use std::fmt::Write as _;
+                            let _ = write!(&mut hex, "{:02x}", b);
+                        }
+                    }
+                    hex
+                };
+                let rid = req_id.unwrap_or_else(|| format!("auto-batch:{}:{}:{}", arrival_time_ms, d, key_preview));
+                let delay_budget_ms = d.saturating_sub(arrival_time_ms);
+                let meta = AawsMeta {
+                    priority: p,
+                    deadline_ms: d,
+                    actual_key: Vec::new(),
+                    request_id: rid,
+                    arrival_time_ms,
+                    delay_budget_ms,
+                };
+                block_delay_until_sched(&meta);
+            }
+        }
+        // Forward if needed
+        forward_unary!(self.proxy, raw_batch_put, ctx, req, sink);
+        // Execute locally
+        let storage = self.storage.clone();
+        let task = async move {
+            use crate::server::service::kv::future_raw_batch_put;
+            let resp = future_raw_batch_put(&storage, req).await?;
+            sink.success(resp).await?;
+            ServerResult::Ok(())
+        }
+        .map_err(|e| {
+            log_net_error!(e, "kv rpc failed"; "request" => "raw_batch_put");
+            GRPC_MSG_FAIL_COUNTER.raw_batch_put.inc();
         })
         .map(|_| ());
         ctx.spawn(task);

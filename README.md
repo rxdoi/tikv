@@ -2,7 +2,7 @@
 
 If you just want **TiKV + PD**, without TiDB SQL:
 
-### Clone/Build TiKV
+### Clone/Build TiKV (from scratch)
 
 Prerequisites (macOS):
 ```bash
@@ -13,22 +13,57 @@ source $HOME/.cargo/env
 ```
 
 ```bash
-# already in repo root
-# build tikv-server with cmake policy hint (fixes grpc/c-ares cmake check on macOS)
-export CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
-cargo build --bin tikv-server --release
+# already in repo root; get submodules (go-ycsb)
+git submodule update --init --recursive
+
+# build tikv-server (pass env in ONE line so nested CMake picks them)
+env PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:${PKG_CONFIG_PATH}" \
+    CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" \
+    CMAKE_POLICY_VERSION_MINIMUM=3.5 \
+    cargo build --bin tikv-server --release -v
+
+# build PD
+cd pd && make && cd ..
+
+# build CSV replay tool (client) with batching disabled so per-request headers reach server
+cd go-ycsb && go build -o bin/csv-ycsb ./cmd/csv-ycsb && cd ..
 ```
 
-Build troubleshooting:
-- If you see a CMake error from grpcio-sys/c-ares like “Compatibility with CMake < 3.5 has been removed … or add -DCMAKE_POLICY_VERSION_MINIMUM=3.5 …”, do:
+Build troubleshooting (macOS, Homebrew):
+- Verify toolchain:
+  ```bash
+  cmake --version
+  pkg-config --version
+  brew --prefix openssl@3
+  ```
+- If you see a CMake error from grpcio-sys/c-ares like “Compatibility with CMake < 3.5 has been removed … or add -DCMAKE_POLICY_VERSION_MINIMUM=3.5 …”, run with env variables in the SAME command line to ensure they reach nested CMake:
   ```bash
   cargo clean
-  export CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
-  # Optional: help OpenSSL linking if needed
-  export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:${PKG_CONFIG_PATH}"
-  cargo build --bin tikv-server --release -v
+  env PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:${PKG_CONFIG_PATH}" \
+      CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" \
+      CMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      cargo build --bin tikv-server --release -v
   ```
-- Ensure you have `cmake` and `pkg-config` installed (see prerequisites above).
+- If OpenSSL linking errors occur, also try:
+  ```bash
+  env OPENSSL_DIR="$(brew --prefix openssl@3)" \
+      OPENSSL_NO_VENDOR=1 \
+      PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:${PKG_CONFIG_PATH}" \
+      CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" \
+      CMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      cargo build --bin tikv-server --release -v
+  ```
+- Still stuck? Clear build artifacts for C/C++ deps and retry:
+  ```bash
+  cargo clean
+  rm -rf target/release/build/grpcio-sys-*
+  rm -rf target/release/build/libz-sys-*
+  env PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:${PKG_CONFIG_PATH}" \
+      CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" \
+      CMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      cargo build --bin tikv-server --release -v
+  ```
+- Ensure you have latest Homebrew `cmake` and `pkg-config` installed.
 
 ## TiKV always requires at least one PD (Placement Driver)
 
@@ -127,16 +162,6 @@ This repository includes a CSV replay tool (in the `go-ycsb` submodule) which re
 - Scheduling metadata (priority/arrival/deadline) is attached as gRPC headers; TiKV reads them and schedules on the server side.  
 - Data plane remains clean: only the original `key/value` is written (no header injection).
 
-#### 5.1 Initialize & build
-```bash
-# initialize submodule
-git submodule update --init --recursive
-
-# build replay tool
-cd go-ycsb
-go build -o bin/csv-ycsb ./cmd/csv-ycsb
-```
-
 #### 5.2 Run replay (server-side scheduling ON)
 ```bash
 # assuming PD/TiKV are up as above (default API V1)
@@ -144,8 +169,7 @@ go build -o bin/csv-ycsb ./cmd/csv-ycsb
   -csv ./delay_sample_requests.csv \
   -pd 127.0.0.1:2379 \
   -table usertable \
-  -apiversion V1 \
-  -v
+  -apiversion V1
 ```
 
 Parameters:
@@ -153,12 +177,10 @@ Parameters:
 - `-pd`: PD endpoints (comma-separated).
 - `-table`: Namespace prefix; final key is `table:key` (for isolation only).
 - `-apiversion`: `V1 | V2` – must match TiKV storage API (default V1).
-- `-v`: Verbose logs.
 - Optional `-max-wait-seconds`: If a request is late by more than this, skip it (default 0 = never skip).
-- Optional client trace `-trace`: Writes client-side timestamps (arrival/send/done). If you want detailed server-side scheduling trace (below), omit `-trace` to avoid confusion.
 
-Client-side scheduling (optional baseline):
-- You can disable client-side scheduling with `-no-scheduling` (the server still schedules via headers).
+Notes:
+- The client always attaches scheduling headers and sends once at arrival time. Scheduling/queuing is performed on the server.
 
 Server-side scheduler knobs (v0 defaults, compiled-in):
 - Worker slots = `8`. Priority thresholds: High=1, Medium=2, Low=4.
@@ -167,9 +189,9 @@ Server-side scheduler knobs (v0 defaults, compiled-in):
 The tool prints go-ycsb style latency stats (AVG/P50/P90/P95/P99/OPS). `Errors: 0` means all writes succeeded.
 
 #### 5.3 Server-side scheduling trace CSV (written by TiKV)
-TiKV now emits a server-side scheduling trace that is continuously refreshed every ~10ms:
+TiKV now emits a server-side scheduling trace that is continuously refreshed every ~10ms. To avoid confusion with the client `-trace` output, the server file name is:
 ```text
-./replay_trace.csv
+./replay_trace_server.csv
 ```
 Columns:
 - `request_id`: Unique identifier (from `x-aaws-request-id` header, or synthesized).
@@ -177,14 +199,18 @@ Columns:
 - `arrival_time_ms`: When the server received the request (or from header if present).
 - `deadline_ms`: Absolute deadline from header.
 - `delay_budget_ms`: `deadline_ms - arrival_time_ms`.
-- `scheduled_time_ms`: When the server admitted the request to run.
-- `scheduling_delay_ms`: `scheduled_time_ms - arrival_time_ms`.
-- `available_threads_at_schedule`: Available virtual slots at scheduling time.
+- `scheduled_time_ms`: Event timestamp; for “check-delay” records it is the check time; for “scheduled”/“urgent-admit” it is the admit time.
+- `scheduling_delay_ms`: `scheduled_time_ms - arrival_time_ms` (for “check-delay” reflects current waiting time).
+- `available_threads_at_schedule`: Available virtual slots at this event time.
 - `required_threads`: Threshold required by priority.
-- `decision`: `immediate` if admitted with 0 delay; otherwise `delayed`.
+- `decision`: One of:
+  - `check-delay` → not enough slots at this check; the request continues waiting.
+  - `scheduled` → admitted because slots are sufficient.
+  - `urgent-admit` → admitted because it is near deadline (urgency margin).
 
 Notes:
 - The CSV is rewritten atomically in-place for a consistent snapshot. If you need a final snapshot after a run, copy it after replay completes.
+- If you also enable client `-trace`, it will generate a different per-op CSV at the client side; use the server file above for scheduling internals.
 - To align server/client views, ensure your machine clock is consistent (single-host runs are fine).
 
 <img src="images/tikv-logo.png" alt="tikv_logo" width="300"/>

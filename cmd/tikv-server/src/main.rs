@@ -235,6 +235,19 @@ fn main() {
     // because `initial_logger()` handles various conditions.
     server::setup::initial_logger(&config);
 
+    // Start server-side scheduling trace writer early so the CSV appears in CWD.
+    {
+        // Best-effort: don't fail startup if module path changes.
+        #[allow(unused)]
+        fn start_trace_writer() {
+            // This path exists in the tikv crate.
+            #[allow(unused_imports)]
+            use tikv::server::service::agent_scheduler::ensure_trace_writer_started;
+            ensure_trace_writer_started();
+        }
+        start_trace_writer();
+    }
+
     // Print version information.
     tikv::log_tikv_info(build_timestamp);
 
