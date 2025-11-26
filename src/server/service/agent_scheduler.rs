@@ -15,6 +15,7 @@ use tokio::time::sleep;
 use std::thread;
 use std::fs;
 use std::io::Write;
+use chrono::{NaiveDateTime, SecondsFormat, Utc};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AawsPriority {
@@ -29,6 +30,10 @@ pub struct AawsMeta {
     // absolute deadline in milliseconds since UNIX_EPOCH
     pub deadline_ms: u64,
     pub actual_key: Vec<u8>,
+    // server-side tracing context
+    pub request_id: String,
+    pub arrival_time_ms: u64,
+    pub delay_budget_ms: u64,
 }
 
 // Global knobs (v0: consts; can be turned into config later)
@@ -109,13 +114,39 @@ pub fn record_scheduling_event(rec: AawsSchedRecord) {
     }
 }
 
+#[inline]
+fn record_from_meta(meta: &AawsMeta, decision: &'static str, event_time_ms: u64, avail: usize, required: usize) {
+    let scheduling_delay_ms = event_time_ms.saturating_sub(meta.arrival_time_ms);
+    record_scheduling_event(AawsSchedRecord {
+        request_id: meta.request_id.clone(),
+        priority: meta.priority,
+        arrival_time_ms: meta.arrival_time_ms,
+        deadline_ms: meta.deadline_ms,
+        delay_budget_ms: meta.delay_budget_ms,
+        scheduled_time_ms: event_time_ms,
+        scheduling_delay_ms,
+        available_threads_at_schedule: avail,
+        required_threads: required,
+        decision,
+    });
+}
+
 pub fn ensure_trace_writer_started() {
     TRACE_WRITER_ONCE.call_once(|| {
         thread::spawn(|| {
             // Periodically write the entire CSV snapshot to a temp file then atomically rename.
             // File path relative to TiKV working directory.
-            let output_path = "replay_trace.csv";
-            let tmp_path = "replay_trace.csv.tmp";
+            let output_path = "replay_trace_server.csv";
+            let tmp_path = "replay_trace_server.csv.tmp";
+            // Create header immediately to make file visible even before first event.
+            if let Ok(mut f) = fs::File::create(tmp_path) {
+                let _ = writeln!(
+                    f,
+                    "request_id,priority,arrival_ts,deadline_ts,delay_budget_ms,scheduled_ts,scheduling_delay_ms,available_threads_at_schedule,required_threads,decision"
+                );
+                let _ = f.flush();
+                let _ = fs::rename(tmp_path, output_path);
+            }
             loop {
                 // Sleep first to batch early bursts.
                 thread::sleep(Duration::from_millis(10));
@@ -140,7 +171,7 @@ pub fn ensure_trace_writer_started() {
                 if let Ok(mut f) = fs::File::create(tmp_path) {
                     let _ = writeln!(
                         f,
-                        "request_id,priority,arrival_time_ms,deadline_ms,delay_budget_ms,scheduled_time_ms,scheduling_delay_ms,available_threads_at_schedule,required_threads,decision"
+                        "request_id,priority,arrival_ts,deadline_ts,delay_budget_ms,scheduled_ts,scheduling_delay_ms,available_threads_at_schedule,required_threads,decision"
                     );
                     for r in snapshot.iter() {
                         let pri_str = match r.priority {
@@ -148,15 +179,30 @@ pub fn ensure_trace_writer_started() {
                             AawsPriority::Medium => "MEDIUM",
                             AawsPriority::Low => "LOW",
                         };
+                        let at = NaiveDateTime::from_timestamp_opt(
+                            (r.arrival_time_ms / 1000) as i64,
+                            ((r.arrival_time_ms % 1000) as u32) * 1_000_000,
+                        ).unwrap_or_else(|| NaiveDateTime::from_timestamp_opt(0, 0).unwrap());
+                        let dt = NaiveDateTime::from_timestamp_opt(
+                            (r.deadline_ms / 1000) as i64,
+                            ((r.deadline_ms % 1000) as u32) * 1_000_000,
+                        ).unwrap_or_else(|| NaiveDateTime::from_timestamp_opt(0, 0).unwrap());
+                        let st = NaiveDateTime::from_timestamp_opt(
+                            (r.scheduled_time_ms / 1000) as i64,
+                            ((r.scheduled_time_ms % 1000) as u32) * 1_000_000,
+                        ).unwrap();
+                        let at_s = chrono::DateTime::<Utc>::from_utc(at, Utc).to_rfc3339_opts(SecondsFormat::Nanos, true);
+                        let dt_s = chrono::DateTime::<Utc>::from_utc(dt, Utc).to_rfc3339_opts(SecondsFormat::Nanos, true);
+                        let st_s = chrono::DateTime::<Utc>::from_utc(st, Utc).to_rfc3339_opts(SecondsFormat::Nanos, true);
                         let _ = writeln!(
                             f,
                             "{},{},{},{},{},{},{},{},{},{}",
                             r.request_id,
                             pri_str,
-                            r.arrival_time_ms,
-                            r.deadline_ms,
+                            at_s,
+                            dt_s,
                             r.delay_budget_ms,
-                            r.scheduled_time_ms,
+                            st_s,
                             r.scheduling_delay_ms,
                             r.available_threads_at_schedule,
                             r.required_threads,
@@ -176,14 +222,22 @@ pub async fn maybe_delay_until_sched(meta: &AawsMeta) {
     loop {
         let t = now_ms();
         if t + URGENCY_MARGIN_MS >= meta.deadline_ms {
-            // urgent
+            // urgent admit, record and return
+            let avail = get_available_threads();
+            let required = required_by_priority(meta.priority);
+            record_from_meta(meta, "urgent-admit", t, avail, required);
             return;
         }
         let avail = get_available_threads();
         let required = required_by_priority(meta.priority);
         if avail >= required {
+            // scheduled
+            let t = now_ms();
+            record_from_meta(meta, "scheduled", t, avail, required);
             return;
         }
+        // not enough slots, record a check
+        record_from_meta(meta, "check-delay", t, avail, required);
         sleep(Duration::from_millis(BASE_RECHECK_DELAY_MS)).await;
     }
 }
@@ -192,13 +246,22 @@ pub fn block_delay_until_sched(meta: &AawsMeta) {
     loop {
         let t = now_ms();
         if t + URGENCY_MARGIN_MS >= meta.deadline_ms {
+            // urgent admit, record and return
+            let avail = get_available_threads();
+            let required = required_by_priority(meta.priority);
+            record_from_meta(meta, "urgent-admit", t, avail, required);
             return;
         }
         let avail = get_available_threads();
         let required = required_by_priority(meta.priority);
         if avail >= required {
+            // scheduled
+            let t2 = now_ms();
+            record_from_meta(meta, "scheduled", t2, avail, required);
             return;
         }
+        // not enough slots, record a check
+        record_from_meta(meta, "check-delay", t, avail, required);
         thread::sleep(Duration::from_millis(BASE_RECHECK_DELAY_MS));
     }
 }

@@ -6,9 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"google.golang.org/grpc/metadata"
-	"go.uber.org/atomic"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,16 +16,17 @@ import (
 	"github.com/pingcap/go-ycsb/pkg/measurement"
 	"github.com/pingcap/go-ycsb/pkg/prop"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
+	"github.com/tikv/client-go/v2/config"
 	"github.com/tikv/client-go/v2/rawkv"
 )
 
 // record models one CSV row we care about.
 type record struct {
-	arrival time.Duration // offset from the first arrival in the file
-	maxDelayMs uint64     // local deadline = baseStart + arrival + maxDelayMs
-	priority string       // "H"|"M"|"L"
-	key     string
-	value   string
+	arrival    time.Duration // offset from the first arrival in the file
+	maxDelayMs uint64        // local deadline = baseStart + arrival + maxDelayMs
+	priority   string        // "H"|"M"|"L"
+	key        string
+	value      string
 }
 
 func parseTimeFlexible(s string) (time.Time, error) {
@@ -79,7 +78,7 @@ func loadCSV(path string) ([]record, error) {
 	type rowParsed struct {
 		arrivalAbs time.Time
 		maxDelayMs uint64
-		priority string
+		priority   string
 		key        string
 		value      string
 	}
@@ -105,7 +104,7 @@ func loadCSV(path string) ([]record, error) {
 		outAbs = append(outAbs, rowParsed{
 			arrivalAbs: tm,
 			maxDelayMs: uint64(maxd * 1000.0),
-			priority: prio,
+			priority:   prio,
 			key:        key,
 			value:      val,
 		})
@@ -137,47 +136,24 @@ func loadCSV(path string) ([]record, error) {
 			code = "M"
 		}
 		out = append(out, record{
-			arrival: delta,
+			arrival:    delta,
 			maxDelayMs: rp.maxDelayMs,
-			priority: code,
-			key:     rp.key,
-			value:   rp.value,
+			priority:   code,
+			key:        rp.key,
+			value:      rp.value,
 		})
 	}
 	return out, nil
 }
 
-// AAWS v0 client-side scheduling knobs
-const (
-	thresholdHigh        = 1
-	thresholdMedium      = 2
-	thresholdLow         = 4
-	maxWorkerSlots       = 8
-	baseRecheckDelayMs   = 5
-	urgencyMarginMs      = 10
-)
-
-func requiredByPriority(p string) int {
-	switch strings.ToUpper(p) {
-	case "H":
-		return thresholdHigh
-	case "L":
-		return thresholdLow
-	default:
-		return thresholdMedium
-	}
-}
-
 func main() {
 	var (
-		csvPath  string
-		pd       string
-		apiver   string
-		table    string
-		verbose  bool
-		maxWaitS int
-		noScheduling bool
-		tracePath string
+		csvPath      string
+		pd           string
+		apiver       string
+		table        string
+		verbose      bool
+		maxWaitS     int
 	)
 	flag.StringVar(&csvPath, "csv", "/Users/xuandi_ren/Desktop/tikv/delay_sample_requests.csv", "CSV file path")
 	flag.StringVar(&pd, "pd", "127.0.0.1:2379", "PD endpoints, comma separated")
@@ -185,8 +161,6 @@ func main() {
 	flag.StringVar(&table, "table", "usertable", "Key prefix table name (used only to namespace keys)")
 	flag.BoolVar(&verbose, "v", false, "Verbose logging")
 	flag.IntVar(&maxWaitS, "max-wait-seconds", 0, "Max wait seconds before skipping a late record (0 means no limit)")
-	flag.BoolVar(&noScheduling, "no-scheduling", false, "Disable v0 client-side scheduling; send once at arrival time")
-	flag.StringVar(&tracePath, "trace", "", "If non-empty, write per-op trace CSV with arrival/send/finish timestamps")
 	flag.Parse()
 
 	records, err := loadCSV(csvPath)
@@ -200,6 +174,13 @@ func main() {
 	props := properties.NewProperties()
 	props.Set(prop.MeasurementType, "histogram")
 	measurement.InitMeasure(props)
+
+	// Disable gRPC batch commands so per-request metadata (x-aaws-*) reaches TiKV.
+	config.UpdateGlobal(func(conf *config.Config) {
+		conf.TiKVClient.MaxBatchSize = 0
+		conf.TiKVClient.BatchWaitSize = 0
+		conf.TiKVClient.MaxBatchWaitTime = 0
+	})
 
 	// Create RawKV client with API version
 	ctx := context.Background()
@@ -226,25 +207,7 @@ func main() {
 	var mu sync.Mutex
 	var errorCount int
 	opName := "INSERT"
-	running := atomic.NewInt32(0)
-
-	// Optional per-op trace collection
-	type opResult struct {
-		Index         int
-		Key           string
-		Priority      string
-		MaxDelayMs    uint64
-		ArrivalAt     time.Time
-		SendAt        time.Time
-		DoneAt        time.Time
-		LatencyMicros int64
-		DelayMs       int64
-	}
-	var results []opResult
-	var resCh chan opResult
-	if tracePath != "" {
-		resCh = make(chan opResult, len(records))
-	}
+	// Client no longer collects per-op trace; server emits replay_trace_server.csv.
 
 	for i, rec := range records {
 		wg.Add(1)
@@ -273,127 +236,46 @@ func main() {
 			// Build gRPC metadata for server-side scheduling (only when scheduling is enabled).
 			// Keys are lowercase per gRPC metadata convention.
 			var putCtx context.Context = ctx
-			if !noScheduling {
-				md := metadata.Pairs(
-					"x-aaws-priority", rec.priority,
-					"x-aaws-arrival-ms", strconv.FormatInt(arrivalAt.UnixMilli(), 10),
-					"x-aaws-deadline-ms", strconv.FormatInt(deadlineAt.UnixMilli(), 10),
-				)
-				putCtx = metadata.NewOutgoingContext(ctx, md)
+			reqID := fmt.Sprintf("req-%06d-%s:%s", i+1, table, rec.key)
+			md := metadata.Pairs(
+				"x-aaws-priority", rec.priority,
+				"x-aaws-arrival-ms", strconv.FormatInt(arrivalAt.UnixMilli(), 10),
+				"x-aaws-deadline-ms", strconv.FormatInt(deadlineAt.UnixMilli(), 10),
+				"x-aaws-request-id", reqID,
+			)
+			putCtx = metadata.NewOutgoingContext(ctx, md)
+			// Debug: log metadata on the first request when verbose for troubleshooting server tracing.
+			if verbose && i == 0 {
+				if mdFirst, ok := metadata.FromOutgoingContext(putCtx); ok {
+					fmt.Printf("first request metadata: %+v\n", mdFirst)
+				} else {
+					fmt.Printf("first request metadata: <none>\n")
+				}
 			}
 
 			// Timestamps for tracing
 			var sendAt, doneAt time.Time
 			var lat time.Duration
 
-			if noScheduling {
-				// Baseline: send once at arrival time (no thresholds, no urgency backoff).
-				sendAt = time.Now()
-				err := client.Put(putCtx, key, val)
-				doneAt = time.Now()
-				lat = doneAt.Sub(sendAt)
-				measurement.Measure(opName, sendAt, lat)
-				if err != nil {
-					mu.Lock()
-					errorCount++
-					mu.Unlock()
-					if verbose {
-						fmt.Printf("Put error idx=%d key=%q err=%v lat_us=%s\n", i, rec.key, err, strconv.FormatInt(lat.Microseconds(), 10))
-					}
-				}
-			} else {
-				// v0 client-side scheduling loop
-				for {
-					now := time.Now()
-					urgent := now.After(deadlineAt.Add(-time.Duration(urgencyMarginMs) * time.Millisecond))
-					avail := maxWorkerSlots - int(running.Load())
-					reqNeed := requiredByPriority(rec.priority)
-					allow := avail >= reqNeed || urgent
-					if allow {
-						// acquire
-						running.Inc()
-						sendAt = time.Now()
-						err := client.Put(putCtx, key, val)
-						doneAt = time.Now()
-						lat = doneAt.Sub(sendAt)
-						measurement.Measure(opName, sendAt, lat)
-						running.Dec()
-						if err != nil {
-							mu.Lock()
-							errorCount++
-							mu.Unlock()
-							if verbose {
-								fmt.Printf("Put error idx=%d key=%q err=%v lat_us=%s\n", i, rec.key, err, strconv.FormatInt(lat.Microseconds(), 10))
-							}
-						}
-						break
-					}
-					// delay and re-check
-					time.Sleep(time.Duration(baseRecheckDelayMs) * time.Millisecond)
-					// If exceeded overall patience (optional), continue looping; urgent guard will eventually fire.
-					if verbose && time.Now().After(deadlineAt) {
-						fmt.Printf("request idx=%d became urgent/late; forcing schedule soon\n", i)
-					}
-				}
-			}
-
-			// Emit per-op trace if requested
-			if tracePath != "" {
-				delayMs := sendAt.Sub(arrivalAt).Milliseconds()
-				if delayMs < 0 {
-					delayMs = 0
-				}
-				resCh <- opResult{
-					Index:         i + 1,
-					Key:           rec.key,
-					Priority:      rec.priority,
-					MaxDelayMs:    rec.maxDelayMs,
-					ArrivalAt:     arrivalAt,
-					SendAt:        sendAt,
-					DoneAt:        doneAt,
-					LatencyMicros: lat.Microseconds(),
-					DelayMs:       delayMs,
+			// Send once at arrival; server performs scheduling/queuing.
+			sendAt = time.Now()
+			err := client.Put(putCtx, key, val)
+			doneAt = time.Now()
+			lat = doneAt.Sub(sendAt)
+			measurement.Measure(opName, sendAt, lat)
+			if err != nil {
+				mu.Lock()
+				errorCount++
+				mu.Unlock()
+				if verbose {
+					fmt.Printf("Put error idx=%d key=%q err=%v lat_us=%s\n", i, rec.key, err, strconv.FormatInt(lat.Microseconds(), 10))
 				}
 			}
 		}()
 	}
 	wg.Wait()
 
-	// Write trace CSV if requested
-	if tracePath != "" {
-		close(resCh)
-		for r := range resCh {
-			results = append(results, r)
-		}
-		sort.Slice(results, func(i, j int) bool { return results[i].Index < results[j].Index })
-		f, err := os.Create(tracePath)
-		if err != nil {
-			fmt.Printf("failed to create trace file: %v\n", err)
-		} else {
-			defer f.Close()
-			w := csv.NewWriter(f)
-			_ = w.Write([]string{"index", "key", "priority", "max_delay_ms", "arrival_ts", "send_ts", "done_ts", "delay_ms", "latency_us"})
-			for _, r := range results {
-				_ = w.Write([]string{
-					strconv.Itoa(r.Index),
-					r.Key,
-					r.Priority,
-					strconv.FormatUint(r.MaxDelayMs, 10),
-					r.ArrivalAt.Format(time.RFC3339Nano),
-					r.SendAt.Format(time.RFC3339Nano),
-					r.DoneAt.Format(time.RFC3339Nano),
-					strconv.FormatInt(r.DelayMs, 10),
-					strconv.FormatInt(r.LatencyMicros, 10),
-				})
-			}
-			w.Flush()
-			if err := w.Error(); err != nil {
-				fmt.Printf("failed to write trace file: %v\n", err)
-			} else if true {
-				fmt.Printf("trace written: %s (%d rows)\n", tracePath, len(results))
-			}
-		}
-	}
+	// Client trace disabled; use server-side replay_trace_server.csv instead.
 
 	fmt.Println("**********************************************")
 	fmt.Println("CSV replay finished")
@@ -401,5 +283,3 @@ func main() {
 	fmt.Println("**********************************************")
 	measurement.Summary()
 }
-
-
