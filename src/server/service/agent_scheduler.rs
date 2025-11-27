@@ -92,6 +92,31 @@ pub fn inc_running() {
     RUNNING_WRITES.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Atomically try to reserve 1 slot (each write uses 1 slot).
+/// Returns true if reservation succeeded, false otherwise.
+/// The 'required' parameter is the minimum available slots needed for this priority,
+/// but we only reserve 1 slot per write.
+#[inline]
+pub fn try_reserve_slot(required_min_available: usize) -> bool {
+    loop {
+        let current = RUNNING_WRITES.load(Ordering::Acquire);
+        let available = MAX_WORKER_SLOTS.saturating_sub(current);
+        if available < required_min_available {
+            return false;
+        }
+        // Try to atomically reserve 1 slot
+        match RUNNING_WRITES.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(_) => continue, // Retry on failure (another thread modified it)
+        }
+    }
+}
+
 #[inline]
 pub fn dec_running() {
     RUNNING_WRITES.fetch_sub(1, Ordering::Relaxed);
@@ -217,24 +242,31 @@ pub fn ensure_trace_writer_started() {
     });
 }
 
-pub async fn maybe_delay_until_sched(meta: &AawsMeta) {
+/// Returns true if a slot was reserved atomically, false if urgent admission happened without reservation
+pub async fn maybe_delay_until_sched(meta: &AawsMeta) -> bool {
     // Background re-check loop (per-request)
+    let required = required_by_priority(meta.priority);
     loop {
         let t = now_ms();
         if t + URGENCY_MARGIN_MS >= meta.deadline_ms {
-            // urgent admit, record and return
+            // urgent admit - try to reserve slot, but allow even if it fails (deadline approaching)
             let avail = get_available_threads();
-            let required = required_by_priority(meta.priority);
-            record_from_meta(meta, "urgent-admit", t, avail, required);
-            return;
+            if try_reserve_slot(required) {
+                record_from_meta(meta, "urgent-admit", t, avail, required);
+                return true; // Slot reserved
+            } else {
+                // Still admit urgently even if we can't reserve (deadline approaching)
+                record_from_meta(meta, "urgent-admit", t, avail, required);
+                return false; // No slot reserved - caller must call inc_running()
+            }
         }
         let avail = get_available_threads();
-        let required = required_by_priority(meta.priority);
-        if avail >= required {
-            // scheduled
+        // Atomically try to reserve 1 slot (checking that at least 'required' are available)
+        if try_reserve_slot(required) {
+            // scheduled - slot reserved atomically
             let t = now_ms();
             record_from_meta(meta, "scheduled", t, avail, required);
-            return;
+            return true; // Slot reserved
         }
         // not enough slots, record a check
         record_from_meta(meta, "check-delay", t, avail, required);

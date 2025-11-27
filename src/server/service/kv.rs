@@ -506,11 +506,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
     // Custom RawPut: read gRPC metadata (x-aaws-*) for scheduling; do not change key/value.
     fn raw_put(&mut self, ctx: RpcContext<'_>, req: RawPutRequest, sink: UnarySink<RawPutResponse>) {
         reject_if_cluster_id_mismatch!(req, self, ctx, sink);
-        // Server-side scheduling BEFORE potential forwarding, so forwarded calls are also delayed properly.
+        // Parse metadata from incoming headers for server-side scheduling
         let headers = ctx.request_headers().clone();
-        {
+        let meta = {
             use crate::server::service::agent_scheduler::{
-                ensure_trace_writer_started, block_delay_until_sched, AawsMeta, AawsPriority,
+                ensure_trace_writer_started, AawsMeta, AawsPriority,
             };
             use std::time::{SystemTime, UNIX_EPOCH};
             fn now_ms() -> u64 {
@@ -566,23 +566,34 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
                 };
                 let rid = req_id.unwrap_or_else(|| format!("auto:{}:{}:{}", arrival_time_ms, d, key_preview));
                 let delay_budget_ms = d.saturating_sub(arrival_time_ms);
-                let meta = AawsMeta {
+                Some(AawsMeta {
                     priority: p,
                     deadline_ms: d,
                     actual_key: Vec::new(),
                     request_id: rid,
                     arrival_time_ms,
                     delay_budget_ms,
-                };
-                // Block here until scheduled (records per-check inside).
-                block_delay_until_sched(&meta);
+                })
+            } else {
+                None
             }
-        }
-        // After local scheduling, forward if needed (or handle locally).
+        };
+        // After parsing metadata, forward if needed (or handle locally).
         forward_unary!(self.proxy, raw_put, ctx, req, sink);
         let storage = self.storage.clone();
         let task = async move {
-            use crate::server::service::agent_scheduler::{inc_running, dec_running};
+            use crate::server::service::agent_scheduler::{dec_running, maybe_delay_until_sched, inc_running};
+            // Server-side scheduling in async context (non-blocking for gRPC handler thread)
+            // maybe_delay_until_sched() returns true if it atomically reserved a slot, false otherwise
+            let slot_reserved = if let Some(meta) = meta {
+                maybe_delay_until_sched(&meta).await
+            } else {
+                false
+            };
+            // If slot wasn't reserved (no metadata or urgent admission without reservation), increment now
+            if !slot_reserved {
+                inc_running();
+            }
             // Unpack request
             let mut req = req;
             let mut sctx = req.take_context();
@@ -592,8 +603,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
             let key = req.take_key();
             let val = req.take_value();
 
-            // Write
-            inc_running();
+            // Write (slot already reserved if scheduling metadata was present)
             let (cb, fcb) = paired_future_callback();
             let res = if for_atomic {
                 storage.raw_batch_put_atomic(sctx, cf, vec![(key, val)], vec![ttl], cb)

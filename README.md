@@ -25,6 +25,11 @@ env PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:${PKG_CONFIG_PATH}
 # build PD
 cd pd && make && cd ..
 
+# If this doesn't work, we can try this
+``
+cd pd && RELEASE_VERSION="v7.0.0" DASHBOARD=0 make pd-server
+``
+
 # build CSV replay tool (client) with batching disabled so per-request headers reach server
 cd go-ycsb && go build -o bin/csv-ycsb ./cmd/csv-ycsb && cd ..
 ```
