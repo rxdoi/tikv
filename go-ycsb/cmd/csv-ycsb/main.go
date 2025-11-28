@@ -5,12 +5,13 @@ import (
 	"encoding/csv"
 	"flag"
 	"fmt"
-	"google.golang.org/grpc/metadata"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"google.golang.org/grpc/metadata"
 
 	"github.com/magiconair/properties"
 	"github.com/pingcap/go-ycsb/pkg/measurement"
@@ -100,10 +101,10 @@ func loadCSV(path string) ([]record, error) {
 		}
 		prio := strings.TrimSpace(row[h["priority"]])
 		maxdStr := strings.TrimSpace(row[h["request_max_delay"]])
-		maxd, _ := strconv.ParseFloat(maxdStr, 64) // seconds (can be float)
+		maxd, _ := strconv.ParseFloat(maxdStr, 64) // milliseconds (can be float)
 		outAbs = append(outAbs, rowParsed{
 			arrivalAbs: tm,
-			maxDelayMs: uint64(maxd * 1000.0),
+			maxDelayMs: uint64(maxd),
 			priority:   prio,
 			key:        key,
 			value:      val,
@@ -148,12 +149,12 @@ func loadCSV(path string) ([]record, error) {
 
 func main() {
 	var (
-		csvPath      string
-		pd           string
-		apiver       string
-		table        string
-		verbose      bool
-		maxWaitS     int
+		csvPath  string
+		pd       string
+		apiver   string
+		table    string
+		verbose  bool
+		maxWaitS int
 	)
 	flag.StringVar(&csvPath, "csv", "/Users/xuandi_ren/Desktop/tikv/delay_sample_requests.csv", "CSV file path")
 	flag.StringVar(&pd, "pd", "127.0.0.1:2379", "PD endpoints, comma separated")
