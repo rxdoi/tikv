@@ -462,6 +462,8 @@ impl<L: LockManager> TxnSchedulerInner<L> {
 
     fn scale_pool_size(&self, pool_size: usize) {
         self.sched_worker_pool.scale_pool_size(pool_size);
+        // Update agent scheduler thresholds when pool size changes
+        crate::server::service::agent_scheduler::update_agent_scheduler_pool_size(pool_size);
     }
 }
 
@@ -545,6 +547,11 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
             t.saturating_elapsed(),
             "initialized the transaction scheduler"
         );
+        
+        // Initialize agent scheduler with actual pool size
+        // This sets MAX_WORKER_SLOTS and scales thresholds proportionally
+        crate::server::service::agent_scheduler::init_agent_scheduler(config.scheduler_worker_pool_size);
+        
         let mut scheduler = TxnScheduler {
             inner,
             agent_scheduler: None,
@@ -563,7 +570,7 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
     }
 
     pub fn scale_pool_size(&self, pool_size: usize) {
-        self.inner.scale_pool_size(pool_size)
+        self.inner.scale_pool_size(pool_size);
     }
 
     pub fn memory_quota_capacity(&self) -> usize {
