@@ -36,13 +36,16 @@ pub struct AawsMeta {
     pub delay_budget_ms: u64,
 }
 
-// Global knobs (v0: consts; can be turned into config later)
-const THRESHOLD_HIGH: usize = 1;
-const THRESHOLD_MEDIUM: usize = 2;
-const THRESHOLD_LOW: usize = 4;
+// Global knobs - dynamically updated based on scheduler pool size
+// Base ratios: High:Medium:Low = 1:2:4 (sum = 7, leaving 1 slot buffer)
+// These are scaled proportionally based on actual pool size
+static THRESHOLD_HIGH: AtomicUsize = AtomicUsize::new(1);
+static THRESHOLD_MEDIUM: AtomicUsize = AtomicUsize::new(2);
+static THRESHOLD_LOW: AtomicUsize = AtomicUsize::new(4);
+static MAX_WORKER_SLOTS: AtomicUsize = AtomicUsize::new(8); // virtual write slots for availability estimation
+
 const BASE_RECHECK_DELAY_MS: u64 = 5;
 const URGENCY_MARGIN_MS: u64 = 10;
-const MAX_WORKER_SLOTS: usize = 8; // virtual write slots for availability estimation
 
 static RUNNING_WRITES: AtomicUsize = AtomicUsize::new(0);
 
@@ -75,15 +78,16 @@ fn now_ms() -> u64 {
 #[inline]
 fn get_available_threads() -> usize {
     let running = RUNNING_WRITES.load(Ordering::Relaxed);
-    MAX_WORKER_SLOTS.saturating_sub(running)
+    let max_slots = MAX_WORKER_SLOTS.load(Ordering::Relaxed);
+    max_slots.saturating_sub(running)
 }
 
 #[inline]
 fn required_by_priority(p: AawsPriority) -> usize {
     match p {
-        AawsPriority::High => THRESHOLD_HIGH,
-        AawsPriority::Medium => THRESHOLD_MEDIUM,
-        AawsPriority::Low => THRESHOLD_LOW,
+        AawsPriority::High => THRESHOLD_HIGH.load(Ordering::Relaxed),
+        AawsPriority::Medium => THRESHOLD_MEDIUM.load(Ordering::Relaxed),
+        AawsPriority::Low => THRESHOLD_LOW.load(Ordering::Relaxed),
     }
 }
 
@@ -100,7 +104,8 @@ pub fn inc_running() {
 pub fn try_reserve_slot(required_min_available: usize) -> bool {
     loop {
         let current = RUNNING_WRITES.load(Ordering::Acquire);
-        let available = MAX_WORKER_SLOTS.saturating_sub(current);
+        let max_slots = MAX_WORKER_SLOTS.load(Ordering::Relaxed);
+        let available = max_slots.saturating_sub(current);
         if available < required_min_available {
             return false;
         }
@@ -154,6 +159,39 @@ fn record_from_meta(meta: &AawsMeta, decision: &'static str, event_time_ms: u64,
         required_threads: required,
         decision,
     });
+}
+
+/// Initialize agent scheduler with the actual scheduler pool size.
+/// This sets MAX_WORKER_SLOTS and scales thresholds proportionally.
+/// 
+/// Scaling logic:
+/// - Base ratios: High:Medium:Low = 1:2:4 (sum = 7)
+/// - MAX_WORKER_SLOTS = pool_size (matches actual capacity)
+/// - Thresholds are scaled proportionally: threshold = (base_threshold * pool_size) / 8
+/// - Minimum values: High >= 1, Medium >= 1, Low >= 1
+pub fn init_agent_scheduler(pool_size: usize) {
+    // Ensure pool_size is at least 1
+    let pool_size = pool_size.max(1);
+    
+    // Set MAX_WORKER_SLOTS to match actual pool size
+    MAX_WORKER_SLOTS.store(pool_size, Ordering::Release);
+    
+    // Scale thresholds proportionally from base ratios (1:2:4 at pool_size=8)
+    // Formula: threshold = (base_threshold * pool_size + 4) / 8
+    // The +4 ensures rounding up for better distribution
+    let high = ((1 * pool_size + 4) / 8).max(1);
+    let medium = ((2 * pool_size + 4) / 8).max(1);
+    let low = ((4 * pool_size + 4) / 8).max(1);
+    
+    THRESHOLD_HIGH.store(high, Ordering::Release);
+    THRESHOLD_MEDIUM.store(medium, Ordering::Release);
+    THRESHOLD_LOW.store(low, Ordering::Release);
+}
+
+/// Update agent scheduler when pool size changes at runtime.
+/// This is called when scheduler_worker_pool_size is changed dynamically.
+pub fn update_agent_scheduler_pool_size(pool_size: usize) {
+    init_agent_scheduler(pool_size);
 }
 
 pub fn ensure_trace_writer_started() {
