@@ -3,8 +3,8 @@ import random
 from datetime import datetime, timedelta
 
 # Configuration
-NUM_REQUESTS = 1_000_000
-OUTPUT_FILE = 'requests_1million.csv'
+NUM_REQUESTS = 50000
+OUTPUT_FILE = 'requests_50000.csv'
 
 # Priority distribution (similar to original data)
 PRIORITIES = ['High', 'Normal', 'Low']
