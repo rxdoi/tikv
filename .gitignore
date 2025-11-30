@@ -2,6 +2,7 @@
 target/
 **/target/
 
+/replay_trace_server.csv
 # Local data/logs
 pd-data*
 tikv-data*
