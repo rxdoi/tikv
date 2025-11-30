@@ -329,3 +329,30 @@ pub fn block_delay_until_sched(meta: &AawsMeta) {
     }
 }
 
+/// Baseline version: Records metrics but admits immediately without any delays.
+/// This is used to create a baseline comparison against the agentic scheduler.
+/// BASELINE MODE: Completely bypasses slot reservation - always admits immediately.
+/// Returns false so caller always calls inc_running() directly (no atomic reservation checks).
+pub async fn maybe_delay_until_sched_baseline(meta: &AawsMeta) -> bool {
+    let t = now_ms();
+    let avail = get_available_threads();
+    let required = required_by_priority(meta.priority);
+    // BASELINE: Don't try to reserve slots at all - just record metrics and return false
+    // This ensures the caller always calls inc_running() directly, bypassing any atomic checks
+    // that might cause priority-based ordering effects
+    record_from_meta(meta, "baseline-immediate", t, avail, required);
+    return false; // Always return false so caller calls inc_running() directly
+}
+
+/// Baseline version: Records metrics but admits immediately without any delays.
+/// This is used to create a baseline comparison against the agentic scheduler.
+/// BASELINE MODE: Ignores priority requirements - first-come-first-served.
+pub fn block_delay_until_sched_baseline(meta: &AawsMeta) {
+    let t = now_ms();
+    let avail = get_available_threads();
+    let required = required_by_priority(meta.priority);
+    // BASELINE: Don't check slot availability - just record and admit immediately
+    // This ensures first-come-first-served behavior regardless of priority
+    record_from_meta(meta, "baseline-immediate", t, avail, required);
+}
+

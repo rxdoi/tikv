@@ -590,11 +590,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         forward_unary!(self.proxy, raw_put, ctx, req, sink);
         let storage = self.storage.clone();
         let task = async move {
-            use crate::server::service::agent_scheduler::{dec_running, maybe_delay_until_sched, inc_running};
-            // Server-side scheduling in async context (non-blocking for gRPC handler thread)
-            // maybe_delay_until_sched() returns true if it atomically reserved a slot, false otherwise
+            use crate::server::service::agent_scheduler::{dec_running, maybe_delay_until_sched_baseline, inc_running};
+            // BASELINE MODE: Records metrics but admits immediately without delays
+            // maybe_delay_until_sched_baseline() returns true if it atomically reserved a slot, false otherwise
             let slot_reserved = if let Some(meta) = meta {
-                maybe_delay_until_sched(&meta).await
+                maybe_delay_until_sched_baseline(&meta).await
             } else {
                 false
             };
@@ -605,6 +605,9 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
             // Unpack request
             let mut req = req;
             let mut sctx = req.take_context();
+            // BASELINE MODE: Set all priorities to Normal so scheduler pool treats them equally
+            use kvproto::kvrpcpb::CommandPri;
+            sctx.set_priority(CommandPri::Normal);
             let cf = req.take_cf();
             let ttl = req.get_ttl();
             let for_atomic = req.get_for_cas();
@@ -658,7 +661,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         let headers = ctx.request_headers().clone();
         {
             use crate::server::service::agent_scheduler::{
-                ensure_trace_writer_started, block_delay_until_sched, AawsMeta, AawsPriority,
+                ensure_trace_writer_started, block_delay_until_sched_baseline, AawsMeta, AawsPriority,
             };
             use std::time::{SystemTime, UNIX_EPOCH};
             fn now_ms() -> u64 {
@@ -731,7 +734,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
                     arrival_time_ms,
                     delay_budget_ms,
                 };
-                block_delay_until_sched(&meta);
+                // BASELINE MODE: Records metrics but admits immediately without delays
+                block_delay_until_sched_baseline(&meta);
             }
         }
         // Forward if needed
@@ -2315,10 +2319,14 @@ fn future_raw_batch_put<E: Engine, L: LockManager, F: KvFormat>(
 
     let (cb, f) = paired_future_callback();
     let for_atomic = req.get_for_cas();
+    // BASELINE MODE: Set all priorities to Normal so scheduler pool treats them equally
+    let mut ctx = req.take_context();
+    use kvproto::kvrpcpb::CommandPri;
+    ctx.set_priority(CommandPri::Normal);
     let res = if for_atomic {
-        storage.raw_batch_put_atomic(req.take_context(), cf, pairs, ttls, cb)
+        storage.raw_batch_put_atomic(ctx, cf, pairs, ttls, cb)
     } else {
-        storage.raw_batch_put(req.take_context(), cf, pairs, ttls, cb)
+        storage.raw_batch_put(ctx, cf, pairs, ttls, cb)
     };
 
     async move {
