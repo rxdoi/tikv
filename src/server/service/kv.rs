@@ -521,6 +521,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
             let mut pri: Option<AawsPriority> = None;
             let mut ddl_ms: Option<u64> = None;
             let mut arr_ms: Option<u64> = None;
+            let mut delay_budget_ms_meta: Option<u64> = None;
             let mut req_id: Option<String> = None;
             for i in 0..headers.len() {
                 if let Some((k, v)) = headers.get(i) {
@@ -541,6 +542,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
                         if let Ok(s) = std::str::from_utf8(v) {
                             if let Ok(x) = s.parse::<u64>() {
                                 arr_ms = Some(x);
+                            }
+                        }
+                    } else if k == "x-aaws-delay-budget-ms" {
+                        if let Ok(s) = std::str::from_utf8(v) {
+                            if let Ok(x) = s.parse::<u64>() {
+                                delay_budget_ms_meta = Some(x);
                             }
                         }
                     } else if k == "x-aaws-request-id" {
@@ -565,7 +572,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
                     hex
                 };
                 let rid = req_id.unwrap_or_else(|| format!("auto:{}:{}:{}", arrival_time_ms, d, key_preview));
-                let delay_budget_ms = d.saturating_sub(arrival_time_ms);
+                // Use delay_budget_ms from metadata if provided, otherwise calculate from timestamps
+                let delay_budget_ms = delay_budget_ms_meta.unwrap_or_else(|| d.saturating_sub(arrival_time_ms));
                 Some(AawsMeta {
                     priority: p,
                     deadline_ms: d,
@@ -660,6 +668,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
             let mut pri: Option<AawsPriority> = None;
             let mut ddl_ms: Option<u64> = None;
             let mut arr_ms: Option<u64> = None;
+            let mut delay_budget_ms_meta: Option<u64> = None;
             let mut req_id: Option<String> = None;
             for i in 0..headers.len() {
                 if let Some((k, v)) = headers.get(i) {
@@ -680,6 +689,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
                         if let Ok(s) = std::str::from_utf8(v) {
                             if let Ok(x) = s.parse::<u64>() {
                                 arr_ms = Some(x);
+                            }
+                        }
+                    } else if k == "x-aaws-delay-budget-ms" {
+                        if let Ok(s) = std::str::from_utf8(v) {
+                            if let Ok(x) = s.parse::<u64>() {
+                                delay_budget_ms_meta = Some(x);
                             }
                         }
                     } else if k == "x-aaws-request-id" {
@@ -706,7 +721,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
                     hex
                 };
                 let rid = req_id.unwrap_or_else(|| format!("auto-batch:{}:{}:{}", arrival_time_ms, d, key_preview));
-                let delay_budget_ms = d.saturating_sub(arrival_time_ms);
+                // Use delay_budget_ms from metadata if provided, otherwise calculate from timestamps
+                let delay_budget_ms = delay_budget_ms_meta.unwrap_or_else(|| d.saturating_sub(arrival_time_ms));
                 let meta = AawsMeta {
                     priority: p,
                     deadline_ms: d,

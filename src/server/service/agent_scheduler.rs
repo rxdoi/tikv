@@ -9,13 +9,13 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, Once};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH, Instant};
 
-use tokio::time::sleep;
 use std::thread;
 use std::fs;
 use std::io::Write;
-use chrono::{NaiveDateTime, SecondsFormat, Utc};
+use tikv_util::timer::GLOBAL_TIMER_HANDLE;
+use futures::compat::Future01CompatExt;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AawsPriority {
@@ -45,7 +45,7 @@ static THRESHOLD_LOW: AtomicUsize = AtomicUsize::new(4);
 static MAX_WORKER_SLOTS: AtomicUsize = AtomicUsize::new(8); // virtual write slots for availability estimation
 
 const BASE_RECHECK_DELAY_MS: u64 = 5;
-const URGENCY_MARGIN_MS: u64 = 10;
+const URGENCY_MARGIN_MS: u64 = 5;
 
 static RUNNING_WRITES: AtomicUsize = AtomicUsize::new(0);
 
@@ -199,6 +199,10 @@ pub fn ensure_trace_writer_started() {
         thread::spawn(|| {
             // Periodically write the entire CSV snapshot to a temp file then atomically rename.
             // File path relative to TiKV working directory.
+            //
+            // The loop terminates once the number of recorded events stops growing for
+            // three consecutive iterations, which roughly means no new trace events
+            // are being appended and the writer is \"done\".
             let output_path = "replay_trace_server.csv";
             let tmp_path = "replay_trace_server.csv.tmp";
             // Create header immediately to make file visible even before first event.
@@ -212,7 +216,7 @@ pub fn ensure_trace_writer_started() {
             }
             loop {
                 // Sleep first to batch early bursts.
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(Duration::from_secs(5));
                 let snapshot = {
                     if let Ok(vec) = TRACE_VEC.lock() {
                         vec.clone()
@@ -221,6 +225,7 @@ pub fn ensure_trace_writer_started() {
                     }
                 };
                 if snapshot.is_empty() {
+                    // No events yet; keep waiting.
                     continue;
                 }
                 // Sort by arrival_time_ms, then scheduled_time_ms to produce a stable timeline.
@@ -242,30 +247,15 @@ pub fn ensure_trace_writer_started() {
                             AawsPriority::Medium => "MEDIUM",
                             AawsPriority::Low => "LOW",
                         };
-                        let at = NaiveDateTime::from_timestamp_opt(
-                            (r.arrival_time_ms / 1000) as i64,
-                            ((r.arrival_time_ms % 1000) as u32) * 1_000_000,
-                        ).unwrap_or_else(|| NaiveDateTime::from_timestamp_opt(0, 0).unwrap());
-                        let dt = NaiveDateTime::from_timestamp_opt(
-                            (r.deadline_ms / 1000) as i64,
-                            ((r.deadline_ms % 1000) as u32) * 1_000_000,
-                        ).unwrap_or_else(|| NaiveDateTime::from_timestamp_opt(0, 0).unwrap());
-                        let st = NaiveDateTime::from_timestamp_opt(
-                            (r.scheduled_time_ms / 1000) as i64,
-                            ((r.scheduled_time_ms % 1000) as u32) * 1_000_000,
-                        ).unwrap();
-                        let at_s = chrono::DateTime::<Utc>::from_utc(at, Utc).to_rfc3339_opts(SecondsFormat::Nanos, true);
-                        let dt_s = chrono::DateTime::<Utc>::from_utc(dt, Utc).to_rfc3339_opts(SecondsFormat::Nanos, true);
-                        let st_s = chrono::DateTime::<Utc>::from_utc(st, Utc).to_rfc3339_opts(SecondsFormat::Nanos, true);
                         let _ = writeln!(
                             f,
                             "{},{},{},{},{},{},{},{},{},{}",
                             r.request_id,
                             pri_str,
-                            at_s,
-                            dt_s,
+                            r.arrival_time_ms,
+                            r.deadline_ms,
                             r.delay_budget_ms,
-                            st_s,
+                            r.scheduled_time_ms,
                             r.scheduling_delay_ms,
                             r.available_threads_at_schedule,
                             r.required_threads,
@@ -294,7 +284,7 @@ pub async fn maybe_delay_until_sched(meta: &AawsMeta) -> bool {
                 return true; // Slot reserved
             } else {
                 // Still admit urgently even if we can't reserve (deadline approaching)
-                record_from_meta(meta, "urgent-admit", t, avail, required);
+            record_from_meta(meta, "urgent-admit", t, avail, required);
                 return false; // No slot reserved - caller must call inc_running()
             }
         }
@@ -308,7 +298,10 @@ pub async fn maybe_delay_until_sched(meta: &AawsMeta) -> bool {
         }
         // not enough slots, record a check
         record_from_meta(meta, "check-delay", t, avail, required);
-        sleep(Duration::from_millis(BASE_RECHECK_DELAY_MS)).await;
+        let _ = GLOBAL_TIMER_HANDLE
+            .delay(Instant::now() + Duration::from_millis(BASE_RECHECK_DELAY_MS))
+            .compat()
+            .await;
     }
 }
 
