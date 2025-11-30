@@ -242,6 +242,7 @@ func main() {
 				"x-aaws-priority", rec.priority,
 				"x-aaws-arrival-ms", strconv.FormatInt(arrivalAt.UnixMilli(), 10),
 				"x-aaws-deadline-ms", strconv.FormatInt(deadlineAt.UnixMilli(), 10),
+				"x-aaws-delay-budget-ms", strconv.FormatUint(rec.maxDelayMs, 10),
 				"x-aaws-request-id", reqID,
 			)
 			putCtx = metadata.NewOutgoingContext(ctx, md)
