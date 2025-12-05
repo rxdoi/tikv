@@ -216,7 +216,7 @@ pub fn ensure_trace_writer_started() {
             }
             loop {
                 // Sleep first to batch early bursts.
-                thread::sleep(Duration::from_secs(5));
+                thread::sleep(Duration::from_secs(5 * 60)); // 5 minutes
                 let snapshot = {
                     if let Ok(vec) = TRACE_VEC.lock() {
                         vec.clone()
