@@ -654,11 +654,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         sink: UnarySink<RawBatchPutResponse>,
     ) {
         reject_if_cluster_id_mismatch!(req, self, ctx, sink);
-        // Pre-scheduling at entry
+        // Parse metadata from incoming headers for server-side scheduling
         let headers = ctx.request_headers().clone();
-        {
+        let meta = {
             use crate::server::service::agent_scheduler::{
-                ensure_trace_writer_started, block_delay_until_sched, AawsMeta, AawsPriority,
+                ensure_trace_writer_started, AawsMeta, AawsPriority,
             };
             use std::time::{SystemTime, UNIX_EPOCH};
             fn now_ms() -> u64 {
@@ -723,24 +723,38 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
                 let rid = req_id.unwrap_or_else(|| format!("auto-batch:{}:{}:{}", arrival_time_ms, d, key_preview));
                 // Use delay_budget_ms from metadata if provided, otherwise calculate from timestamps
                 let delay_budget_ms = delay_budget_ms_meta.unwrap_or_else(|| d.saturating_sub(arrival_time_ms));
-                let meta = AawsMeta {
+                Some(AawsMeta {
                     priority: p,
                     deadline_ms: d,
                     actual_key: Vec::new(),
                     request_id: rid,
                     arrival_time_ms,
                     delay_budget_ms,
-                };
-                block_delay_until_sched(&meta);
+                })
+            } else {
+                None
             }
-        }
+        };
         // Forward if needed
         forward_unary!(self.proxy, raw_batch_put, ctx, req, sink);
         // Execute locally
         let storage = self.storage.clone();
         let task = async move {
+            use crate::server::service::agent_scheduler::{dec_running, maybe_delay_until_sched, inc_running};
             use crate::server::service::kv::future_raw_batch_put;
+            // Server-side scheduling in async context (non-blocking for gRPC handler thread)
+            // maybe_delay_until_sched() returns true if it atomically reserved a slot, false otherwise
+            let slot_reserved = if let Some(meta) = meta {
+                maybe_delay_until_sched(&meta).await
+            } else {
+                false
+            };
+            // If slot wasn't reserved (no metadata or urgent admission without reservation), increment now
+            if !slot_reserved {
+                inc_running();
+            }
             let resp = future_raw_batch_put(&storage, req).await?;
+            dec_running();
             sink.success(resp).await?;
             ServerResult::Ok(())
         }
