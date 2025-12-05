@@ -8,6 +8,8 @@ pd-data*
 tikv-data*
 logs/
 
+*.csv
+
 # Binaries
 pd/bin/
 go-ycsb/bin/
