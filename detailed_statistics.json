@@ -1,0 +1,190 @@
+{
+  "agentic": {
+    "name": "Agentic Scheduler",
+    "total_requests": 200000,
+    "unique_requests": 200000,
+    "priority_distribution": {
+      "MEDIUM": 79870,
+      "HIGH": 70232,
+      "LOW": 49898
+    },
+    "priority_percentages": {
+      "MEDIUM": 39.934999999999995,
+      "HIGH": 35.116,
+      "LOW": 24.948999999999998
+    },
+    "decision_distribution": {
+      "scheduled": 187171,
+      "urgent-admit": 12829
+    },
+    "scheduling_delay": {
+      "mean": 3.469695,
+      "median": 0.0,
+      "p50": 0.0,
+      "p75": 0.0,
+      "p90": 10.0,
+      "p95": 16.0,
+      "p99": 53.0,
+      "max": "408",
+      "std": 14.197161314992586
+    },
+    "weighted_scheduling_delay": {
+      "mean": 3.2257799219462133,
+      "total": 222590.74999999997
+    },
+    "deadline_misses": {
+      "count": 1165,
+      "percentage": 0.5825,
+      "weighted_count": 403.15,
+      "weighted_percentage": 0.5842440332909683
+    },
+    "deadline_miss_severity": {
+      "mean_ms": 61.73648068669528,
+      "median_ms": 26.0,
+      "max_ms": "348",
+      "p95_ms": 249.0
+    },
+    "delay_budget_utilization": {
+      "mean": 0.09543290656168081,
+      "median": 0.0,
+      "p95": 0.6428571428571429,
+      "over_budget_count": "1165",
+      "over_budget_percentage": 0.5825
+    },
+    "per_priority": {
+      "HIGH": {
+        "count": 70232,
+        "mean_delay_ms": 1.8451702927440483,
+        "median_delay_ms": 0.0,
+        "p95_delay_ms": 10.0,
+        "deadline_misses": 630,
+        "deadline_miss_percentage": 0.8970269962410297
+      },
+      "MEDIUM": {
+        "count": 79870,
+        "mean_delay_ms": 3.0171528734193065,
+        "median_delay_ms": 0.0,
+        "p95_delay_ms": 16.0,
+        "deadline_misses": 326,
+        "deadline_miss_percentage": 0.40816326530612246
+      },
+      "LOW": {
+        "count": 49898,
+        "mean_delay_ms": 6.480600424866728,
+        "median_delay_ms": 0.0,
+        "p95_delay_ms": 30.0,
+        "deadline_misses": 209,
+        "deadline_miss_percentage": 0.4188544631047337
+      }
+    },
+    "zero_delay": {
+      "count": 151685,
+      "percentage": 75.8425
+    }
+  },
+  "baseline": {
+    "name": "Baseline",
+    "total_requests": 200000,
+    "unique_requests": 200000,
+    "priority_distribution": {
+      "MEDIUM": 79870,
+      "HIGH": 70232,
+      "LOW": 49898
+    },
+    "priority_percentages": {
+      "MEDIUM": 39.934999999999995,
+      "HIGH": 35.116,
+      "LOW": 24.948999999999998
+    },
+    "decision_distribution": {
+      "baseline-immediate": 200000
+    },
+    "scheduling_delay": {
+      "mean": 0.640225,
+      "median": 0.0,
+      "p50": 0.0,
+      "p75": 0.0,
+      "p90": 0.0,
+      "p95": 1.0,
+      "p99": 8.0,
+      "max": "392",
+      "std": 8.622431135182723
+    },
+    "weighted_scheduling_delay": {
+      "mean": 0.6375882742519604,
+      "total": 43995.950000000004
+    },
+    "deadline_misses": {
+      "count": 931,
+      "percentage": 0.4655,
+      "weighted_count": 328.45000000000005,
+      "weighted_percentage": 0.4759889687074751
+    },
+    "deadline_miss_severity": {
+      "mean_ms": 58.26960257787326,
+      "median_ms": 38.0,
+      "max_ms": "381",
+      "p95_ms": 187.0
+    },
+    "delay_budget_utilization": {
+      "mean": 0.02529458690488549,
+      "median": 0.0,
+      "p95": 0.006944444444444444,
+      "over_budget_count": "931",
+      "over_budget_percentage": 0.4655
+    },
+    "per_priority": {
+      "HIGH": {
+        "count": 70232,
+        "mean_delay_ms": 0.5969501082127805,
+        "median_delay_ms": 0.0,
+        "p95_delay_ms": 1.0,
+        "deadline_misses": 576,
+        "deadline_miss_percentage": 0.8201389679917986
+      },
+      "MEDIUM": {
+        "count": 79870,
+        "mean_delay_ms": 0.65040691123075,
+        "median_delay_ms": 0.0,
+        "p95_delay_ms": 1.0,
+        "deadline_misses": 254,
+        "deadline_miss_percentage": 0.31801677726305244
+      },
+      "LOW": {
+        "count": 49898,
+        "mean_delay_ms": 0.6848370676179406,
+        "median_delay_ms": 0.0,
+        "p95_delay_ms": 1.0,
+        "deadline_misses": 101,
+        "deadline_miss_percentage": 0.20241292236161773
+      }
+    },
+    "zero_delay": {
+      "count": 188790,
+      "percentage": 94.395
+    }
+  },
+  "comparison": {
+    "scheduling_delay": {
+      "mean_improvement_ms": -2.82947,
+      "mean_improvement_pct": -441.9493146940528,
+      "median_improvement_ms": 0.0,
+      "p95_improvement_ms": -15.0,
+      "p95_improvement_pct": -1500.0
+    },
+    "weighted_delay": {
+      "improvement": -2.588191647694253,
+      "improvement_pct": -405.93463716546626
+    },
+    "deadline_misses": {
+      "absolute_reduction": -234,
+      "relative_reduction_pct": -25.13426423200859,
+      "weighted_reduction": -74.69999999999993,
+      "weighted_reduction_pct": -22.74318769980208
+    },
+    "zero_delay": {
+      "increase": -37105,
+      "increase_pct": -19.654113035648074
+    }
+  }
+}
