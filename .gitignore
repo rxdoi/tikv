@@ -9,6 +9,7 @@ tikv-data*
 logs/
 
 *.csv
+*.tmp
 
 # Binaries
 pd/bin/
